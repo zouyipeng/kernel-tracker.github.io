@@ -1,6 +1,8 @@
 import json
 import sys
+import time
 from typing import Any, Dict
+import ssl
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
@@ -8,19 +10,53 @@ from urllib.request import Request, urlopen
 BASE_SITE = "https://zouyipeng.github.io"
 BASE_PATH = "/kernel-tracker.github.io"
 
+_TLS_CONTEXT = ssl.create_default_context()
+if hasattr(ssl, "TLSVersion"):
+    # Be explicit to avoid old TLS negotiation edge cases.
+    _TLS_CONTEXT.minimum_version = ssl.TLSVersion.TLSv1_2
 
-def _http_get_json(url: str, timeout_s: int = 10) -> Any:
-    req = Request(
-        url,
-        headers={
-            "User-Agent": "kernel-tracker-summary-fetcher/1.0",
-            "Accept": "application/json,text/plain,*/*",
-        },
-        method="GET",
-    )
-    with urlopen(req, timeout=timeout_s) as resp:
-        raw = resp.read().decode("utf-8")
-    return json.loads(raw)
+
+def _http_get_json(url: str, timeout_s: int = 10, retries: int = 5) -> Any:
+    last_err: Exception | None = None
+    for attempt in range(1, retries + 1):
+        try:
+            req = Request(
+                url,
+                headers={
+                    "User-Agent": "kernel-tracker-summary-fetcher/1.1",
+                    "Accept": "application/json,text/plain,*/*",
+                    "Cache-Control": "no-cache",
+                    "Pragma": "no-cache",
+                },
+                method="GET",
+            )
+            with urlopen(req, timeout=timeout_s, context=_TLS_CONTEXT) as resp:
+                raw = resp.read().decode("utf-8")
+            return json.loads(raw)
+        except HTTPError as e:
+            # GitHub Pages/CDN can occasionally throw transient 5xx.
+            if attempt < retries and e.code in (500, 502, 503, 504):
+                time.sleep(0.6 * (2 ** (attempt - 1)))
+                last_err = e
+                continue
+            raise
+        except (URLError, ssl.SSLError) as e:
+            # Network/TLS flakiness: retry with exponential backoff.
+            if attempt < retries:
+                time.sleep(0.6 * (2 ** (attempt - 1)))
+                last_err = e
+                continue
+            raise
+        except json.JSONDecodeError as e:
+            # If we got HTML/error page masquerading as JSON, a short retry helps.
+            if attempt < retries:
+                time.sleep(0.6 * (2 ** (attempt - 1)))
+                last_err = e
+                continue
+            raise
+    if last_err:
+        raise last_err
+    raise RuntimeError("Unexpected retry loop exit")
 
 
 def _join_url(path: str) -> str:
@@ -65,6 +101,9 @@ def main() -> int:
     except HTTPError as e:
         print(f"[HTTPError] {e.code} {e.reason}: {e.url}", file=sys.stderr)
         return 2
+    except ssl.SSLError as e:
+        print(f"[SSLError] {e}", file=sys.stderr)
+        return 5
     except URLError as e:
         print(f"[URLError] {e.reason}", file=sys.stderr)
         return 3
