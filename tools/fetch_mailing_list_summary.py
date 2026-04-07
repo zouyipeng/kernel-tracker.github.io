@@ -48,6 +48,11 @@ def fetch_latest_mailing_list_summary() -> str:
     if not summary:
         raise RuntimeError(f'Empty "summary" in {data_url}')
 
+    # Keep only the top "今日社区动态" section; drop subsystem breakdowns starting at "## <Subsystem>"
+    cut = summary.find("\n\n## ")
+    if cut != -1:
+        summary = summary[:cut].rstrip()
+
     detail_url = _join_url(f"/{date_str}/mailing-list")
     return f"社区动态（{date_str}）\n\n{summary}\n\n详情请查看：{detail_url}"
 
