@@ -1,0 +1,13 @@
+{
+  "date": "2026-04-10",
+  "sourceName": "Mailing List",
+  "sourceType": "lkml",
+  "generatedAt": "2026-04-10T00:23:28.579Z",
+  "summary": "# 今日社区动态（MiniMax-M2.7 | 2026-04-10 ~ 2026-04-10）\n\n- 🌐 [Networking](#subsystem-Networking)：dsa yt921x 交换机驱动新增端口流量监管和整形（policing/tbf）功能，实现精细化端口级流量控制，提升网络QoS管理能力。\n- 🏗 [Architecture](#subsystem-Architecture)：修复高通 Purwa 平台 GPU IOMMU 属性配置，确保 GPU 正确映射至对应 IOMMU 域，保障图形渲染时的内存访问隔离与安全。\n\n## Networking\n- `feature` 为 DSA yt921x 交换机驱动添加端口流量监管和整形支持，实现端口级 policing 和 tbf 功能，提升网络流量管理能力 [↗](https://lkml.org/lkml/2026/4/10/2)\n- `other` 其他改动多为小修正、清理或配置更新，整体风险较低，详情见：[↗](https://lkml.org/lkml/2026/4/10/34)\n\n## Architecture\n- `feature` 修复高通 Purwa 平台设备树中 GPU IOMMU 属性配置问题，确保 GPU 正确映射到对应的 IOMMU 域，保证图形渲染时内存访问隔离和安全性正常工作 [↗](https://lkml.org/lkml/2026/4/10/13)\n\n## Other\n共4个补丁未能匹配到固定子系统规则，主要涉及Documentation/sphinx和drivers/staging目录的修改。\nUnmatched by fixed subsystem rules: 4 items. Consider extending directory rules to improve classification.\n标签统计：`feature` 2 / `bugfix` 1 / `other` 1 / `perf` 0。",
+  "stats": {
+    "total": 7,
+    "feature": 4,
+    "bugfix": 1,
+    "other": 2
+  }
+}
