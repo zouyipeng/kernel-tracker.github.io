@@ -11,11 +11,13 @@ const printUsage = () => {
 命令:
   all       全量抓取所有信息源数据
   summary   为指定信息源重新生成摘要
+  compact   批量压缩历史数据为单文件精简结构
 
 示例:
   npm run fetch all
   npm run fetch summary --source "Mailing List"
   npm run fetch summary --source "Mainline" --date 2026-03-25
+  npm run fetch compact
 `);
 };
 const parseArgs = () => {
@@ -48,17 +50,46 @@ const runSummary = async (options) => {
         console.error(`错误: 未找到数据文件 ${sourceName}-${dateStr}.json`);
         process.exit(1);
     }
-    if (data.articles.length === 0) {
-        console.error('错误: 数据文件中没有文章');
+    if (!data.articles || data.articles.length === 0) {
+        console.error('错误: 当前数据为精简结构，不包含文章明细，无法重算摘要。请先执行 fetch all 重新抓取。');
         process.exit(1);
     }
     const config = (0, storage_1.loadSourcesConfig)();
-    const source = config.sources.find(s => s.name === sourceName);
-    const summary = await (0, ai_1.generateSummary)(data.articles, source?.summaryPrompt);
+    const summary = await (0, ai_1.generateSummary)(data.articles, {
+        subsystemPrompt: config.subsystemPrompt,
+        overallPrompt: config.overallPrompt,
+        subsystemSummaryConcurrency: config.subsystemSummaryConcurrency,
+        fixedSubsystemRules: config.fixedSubsystemRules,
+    });
     data.summary = summary;
     data.generatedAt = new Date().toISOString();
     (0, storage_1.saveSourceData)(data);
     console.log(`[Summary] 摘要生成完成！`);
+};
+const sourceNameToFileName = (name) => name.toLowerCase().replace(/\s+/g, '-');
+const runCompact = async () => {
+    console.log('[Compact] 开始批量压缩历史数据（full -> compact-single-file）...');
+    const index = (0, storage_1.loadSourceDatesIndex)();
+    const config = (0, storage_1.loadSourcesConfig)();
+    const sourceNameMap = new Map(config.sources.map(s => [sourceNameToFileName(s.name), s.name]));
+    let converted = 0;
+    let skipped = 0;
+    for (const [sourceKey, value] of Object.entries(index)) {
+        const sourceName = sourceNameMap.get(sourceKey) || sourceKey;
+        const dates = value?.dates || [];
+        for (const dateStr of dates) {
+            const loaded = (0, storage_1.loadSourceData)(sourceName, dateStr) || (0, storage_1.loadSourceData)(sourceKey, dateStr);
+            if (!loaded) {
+                skipped++;
+                console.log(`[Compact] 跳过: ${sourceKey}-${dateStr}.json (未找到)`);
+                continue;
+            }
+            (0, storage_1.saveSourceData)(loaded);
+            converted++;
+            console.log(`[Compact] 已转换: ${sourceKey}-${dateStr}`);
+        }
+    }
+    console.log(`[Compact] 完成，压缩 ${converted} 个日期数据，跳过 ${skipped} 个`);
 };
 const main = async () => {
     const { command, options } = parseArgs();
@@ -68,6 +99,9 @@ const main = async () => {
             break;
         case 'summary':
             await runSummary(options);
+            break;
+        case 'compact':
+            await runCompact();
             break;
         case 'help':
         case '--help':

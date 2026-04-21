@@ -11,10 +11,12 @@
     "axios": "^1.6.0",
     "cheerio": "^1.0.0",
     "openai": "^4.0.0",
+    "puppeteer-core": "^24.42.0",
     "simple-git": "^3.33.0"
   },
   "devDependencies": {
     "@types/node": "^20.0.0",
+    "@types/puppeteer-core": "^5.4.0",
     "tsx": "^4.0.0",
     "typescript": "^5.0.0"
   }

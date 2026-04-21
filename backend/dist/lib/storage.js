@@ -53,10 +53,45 @@ function loadSourceData(sourceName, dateStr) {
 }
 function saveSourceData(data) {
     ensureDirectoryExists(DATA_DIR);
-    const fileName = `${sourceNameToFileName(data.sourceName)}-${data.date}.json`;
+    const sourceFileName = sourceNameToFileName(data.sourceName);
+    const stats = data.stats || (() => {
+        let feature = 0;
+        let bugfix = 0;
+        let other = 0;
+        let additions = 0;
+        let deletions = 0;
+        for (const article of data.articles || []) {
+            const t = article.patchData?.type || article.gitCommitData?.type;
+            if (t === 'feature')
+                feature++;
+            else if (t === 'bugfix')
+                bugfix++;
+            else
+                other++;
+            additions += article.gitCommitData?.additions || 0;
+            deletions += article.gitCommitData?.deletions || 0;
+        }
+        return {
+            total: (data.articles || []).length,
+            feature,
+            bugfix,
+            other,
+            additions: data.sourceType === 'git' ? additions : undefined,
+            deletions: data.sourceType === 'git' ? deletions : undefined,
+        };
+    })();
+    const compactData = {
+        date: data.date,
+        sourceName: data.sourceName,
+        sourceType: data.sourceType,
+        generatedAt: data.generatedAt,
+        summary: data.summary,
+        stats,
+    };
+    const fileName = `${sourceFileName}-${data.date}.json`;
     const filePath = path_1.default.join(DATA_DIR, fileName);
-    fs_1.default.writeFileSync(filePath, JSON.stringify(data, null, 2), 'utf8');
-    console.log(`[Storage] 数据已保存: ${filePath}`);
+    fs_1.default.writeFileSync(filePath, JSON.stringify(compactData, null, 2), 'utf8');
+    console.log(`[Storage] 精简数据已保存: ${filePath}`);
     updateSourceDatesIndex(data.sourceName, data.date);
 }
 function updateSourceDatesIndex(sourceName, dateStr) {

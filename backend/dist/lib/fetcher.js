@@ -40,8 +40,107 @@ exports.fetchAll = fetchAll;
 const axios_1 = __importDefault(require("axios"));
 const cheerio = __importStar(require("cheerio"));
 const simple_git_1 = __importDefault(require("simple-git"));
+const puppeteer_core_1 = __importDefault(require("puppeteer-core"));
 const storage_1 = require("./storage");
 const ai_1 = require("./ai");
+const subsystem_1 = require("./subsystem");
+const CHROME_PATHS_WIN = [
+    process.env.CHROME_PATH,
+    'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
+    'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
+    process.env.LOCALAPPDATA + '\\Google\\Chrome\\Application\\chrome.exe',
+    'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe',
+    'C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe',
+    process.env.LOCALAPPDATA + '\\Microsoft\\Edge\\Application\\msedge.exe',
+];
+const CHROME_PATHS_MAC = [
+    process.env.CHROME_PATH,
+    '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+    '/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge',
+];
+const CHROME_PATHS_LINUX = [
+    process.env.CHROME_PATH,
+    '/usr/bin/google-chrome',
+    '/usr/bin/chromium-browser',
+    '/usr/bin/chromium',
+    '/usr/bin/microsoft-edge',
+    '/usr/bin/microsoft-edge-stable',
+];
+function findChromePath() {
+    const paths = process.platform === 'win32' ? CHROME_PATHS_WIN
+        : process.platform === 'darwin' ? CHROME_PATHS_MAC
+            : CHROME_PATHS_LINUX;
+    const fs = require('fs');
+    for (const p of paths) {
+        if (p && fs.existsSync(p))
+            return p;
+    }
+    return null;
+}
+async function launchBrowser() {
+    const chromePath = findChromePath();
+    if (!chromePath) {
+        console.error('[Fetcher] 未找到 Chrome/Edge 浏览器，请设置 CHROME_PATH 环境变量');
+        return null;
+    }
+    console.log(`[Fetcher] 使用浏览器: ${chromePath}`);
+    try {
+        const browser = await puppeteer_core_1.default.launch({
+            executablePath: chromePath,
+            headless: false,
+            args: [
+                '--no-sandbox',
+                '--disable-setuid-sandbox',
+                '--disable-blink-features=AutomationControlled',
+            ],
+            defaultViewport: null,
+        });
+        console.log('[Fetcher] 浏览器已启动');
+        return browser;
+    }
+    catch (err) {
+        console.error('[Fetcher] 启动浏览器失败:', err);
+        return null;
+    }
+}
+async function fetchPageWithBrowser(browser, url, waitForSelector, timeoutMs = 60000) {
+    const page = await browser.newPage();
+    try {
+        await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36');
+        await page.setExtraHTTPHeaders({ 'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8' });
+        await page.evaluateOnNewDocument(`Object.defineProperty(navigator, 'webdriver', { get: () => false })`);
+        console.log(`[Fetcher] 浏览器访问: ${url}`);
+        await page.goto(url, { waitUntil: 'networkidle2', timeout: timeoutMs });
+        const maxWait = 90000;
+        const deadline = Date.now() + maxWait;
+        while (Date.now() < deadline) {
+            try {
+                const hasTarget = await page.evaluate(`!!document.querySelector('${waitForSelector.replace(/'/g, "\\'")}')`);
+                if (hasTarget) {
+                    console.log('[Fetcher] 目标内容已加载');
+                    break;
+                }
+            }
+            catch {
+                // page navigated, re-wait for load
+                try {
+                    await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 30000 });
+                }
+                catch { }
+            }
+            const isChallenge = await page.evaluate(`document.body?.textContent?.includes('Anubis') || document.body?.textContent?.includes('工作量证明') || document.body?.textContent?.includes('Proof-of-Work') || document.title?.includes('确认')`).catch(() => false);
+            if (isChallenge) {
+                console.log('[Fetcher] 检测到 Anubis 挑战页面，等待挑战完成...');
+            }
+            await new Promise(r => setTimeout(r, 3000));
+        }
+        const html = await page.content();
+        return html;
+    }
+    finally {
+        await page.close();
+    }
+}
 function buildLkmlDayPageUrl(baseUrl, day) {
     return new URL(`/lkml/${day.getFullYear()}/${day.getMonth() + 1}/${day.getDate()}`, baseUrl).href;
 }
@@ -129,15 +228,36 @@ function parseLkmlPatchText(rawText) {
     }
     const changedFiles = new Set();
     for (const line of lines) {
-        const diffStatMatch = line.match(/^(.+?)\s+\|\s+\d+\s*[+\-]*\s*$/);
-        if (diffStatMatch) {
-            const filePath = diffStatMatch[1].trim();
-            if (filePath && !filePath.includes('file changed'))
-                changedFiles.add(filePath);
+        // diffstat 行经常被 LKML 页面挤到同一行里；因此不要整行截断，而是在行内抽取像路径的 token
+        // 形如: "mm/vmscan.c            | 456 +++++" 或 "drivers/net/ppp/pppoe.c | 166 ++++"
+        const diffStatRe = /(^|\s)(\S+?)\s+\|\s+\d+\b/g;
+        let m;
+        while ((m = diffStatRe.exec(line)) !== null) {
+            const candidate = m[2].trim();
+            if (!candidate)
+                continue;
+            // 过滤掉明显不是路径的内容
+            if (candidate.length > 200)
+                continue;
+            if (!/[\/.]/.test(candidate))
+                continue;
+            if (candidate.includes('://'))
+                continue;
+            if (/^(hi|this|patch|from|signed-off-by)$/i.test(candidate))
+                continue;
+            changedFiles.add(candidate);
         }
-        const diffGitMatch = line.match(/^diff --git a\/(.+?) b\/(.+)$/);
+        // "diff --git a/foo b/foo" 后面可能紧跟 "index ..."（同一行），且不一定在行首
+        const diffGitMatch = line.match(/\bdiff --git a\/(\S+)\s+b\/(\S+)/);
         if (diffGitMatch)
             changedFiles.add(diffGitMatch[2].trim());
+        // 兜底：从 --- a/ 与 +++ b/ 提取（有些补丁没有 diff --git）
+        const minusFile = line.match(/---\s+a\/(\S+)/);
+        if (minusFile)
+            changedFiles.add(minusFile[1].trim());
+        const plusFile = line.match(/\+\+\+\s+b\/(\S+)/);
+        if (plusFile)
+            changedFiles.add(plusFile[1].trim());
     }
     return { commitMessage, changedFiles: Array.from(changedFiles) };
 }
@@ -154,7 +274,24 @@ async function fetchLkmlPatchDetails(patchUrl, headers, timeoutMs) {
         try {
             const response = await axios_1.default.get(patchUrl, { headers, timeout: timeoutMs });
             const $ = cheerio.load(response.data);
-            const rawPatchText = $('pre').first().text().trim();
+            const preTexts = $('pre')
+                .toArray()
+                .map(el => $(el).text())
+                .map(t => (t || '').trim())
+                .filter(Boolean);
+            const scorePre = (t) => {
+                let s = 0;
+                if (/\bdiff --git\b/i.test(t))
+                    s += 50;
+                if (/^---\s+a\//m.test(t) && /^\+\+\+\s+b\//m.test(t))
+                    s += 30;
+                if (/^Signed-off-by:/mi.test(t))
+                    s += 10;
+                if (t.length > 4000)
+                    s += 5;
+                return s;
+            };
+            const rawPatchText = (preTexts.sort((a, b) => scorePre(b) - scorePre(a))[0] || '').trim();
             const parsed = parseLkmlPatchText(rawPatchText);
             const dateRow = $('tr').filter((_, tr) => {
                 const firstCell = $(tr).find('th, td').first().text().replace(/\s+/g, ' ').trim();
@@ -175,6 +312,41 @@ async function fetchLkmlPatchDetails(patchUrl, headers, timeoutMs) {
     }
     return { commitMessage: '', changedFiles: [], sentAt: null };
 }
+async function fetchLkmlPatchDetailsBrowser(browser, patchUrl, timeoutMs) {
+    try {
+        const html = await fetchPageWithBrowser(browser, patchUrl, 'pre', 60000);
+        const $ = cheerio.load(html);
+        const preTexts = $('pre')
+            .toArray()
+            .map(el => $(el).text())
+            .map(t => (t || '').trim())
+            .filter(Boolean);
+        const scorePre = (t) => {
+            let s = 0;
+            if (/\bdiff --git\b/i.test(t))
+                s += 50;
+            if (/^---\s+a\//m.test(t) && /^\+\+\+\s+b\//m.test(t))
+                s += 30;
+            if (/^Signed-off-by:/mi.test(t))
+                s += 10;
+            if (t.length > 4000)
+                s += 5;
+            return s;
+        };
+        const rawPatchText = (preTexts.sort((a, b) => scorePre(b) - scorePre(a))[0] || '').trim();
+        const parsed = parseLkmlPatchText(rawPatchText);
+        const dateRow = $('tr').filter((_, tr) => {
+            const firstCell = $(tr).find('th, td').first().text().replace(/\s+/g, ' ').trim();
+            return firstCell === 'Date';
+        }).first();
+        const dateText = dateRow.find('td').last().text().replace(/\s+/g, ' ').trim();
+        return { ...parsed, sentAt: parseDateTextToIso(dateText) };
+    }
+    catch (error) {
+        console.error(`[Fetcher] LKML - 获取补丁详情失败(浏览器): ${patchUrl}`, error);
+        return { commitMessage: '', changedFiles: [], sentAt: null };
+    }
+}
 async function mapWithConcurrency(items, limit, mapper) {
     if (items.length === 0)
         return [];
@@ -193,13 +365,17 @@ async function mapWithConcurrency(items, limit, mapper) {
 }
 async function fetchLKML(source) {
     const excludeAuthors = source.excludeAuthors || [];
-    const concurrency = source.lkmlDetailConcurrency ?? 12;
-    const timeoutMs = source.lkmlDetailTimeoutMs ?? 8000;
+    const concurrency = Math.min(source.lkmlDetailConcurrency ?? 4, 4);
+    const timeoutMs = source.lkmlDetailTimeoutMs ?? 15000;
+    const browser = await launchBrowser();
+    if (!browser) {
+        console.error('[Fetcher] LKML - 无法启动浏览器，跳过抓取');
+        return [];
+    }
     try {
         const today = new Date();
         const yesterday = new Date(today);
         yesterday.setDate(yesterday.getDate() - 1);
-        const headers = { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' };
         const messages = [];
         const seenUrls = new Set();
         for (const { url, label } of [
@@ -208,8 +384,8 @@ async function fetchLKML(source) {
         ]) {
             console.log(`[Fetcher] LKML - 正在访问 (${label}): ${url}`);
             try {
-                const response = await axios_1.default.get(url, { headers, timeout: 10000 });
-                collectLkmlPatchMessagesFromHtml(response.data, source, excludeAuthors, seenUrls, messages, label);
+                const html = await fetchPageWithBrowser(browser, url, 'table.mh', 90000);
+                collectLkmlPatchMessagesFromHtml(html, source, excludeAuthors, seenUrls, messages, label);
             }
             catch (pageErr) {
                 console.error(`[Fetcher] LKML (${label}) 页面抓取失败:`, pageErr);
@@ -222,7 +398,7 @@ async function fetchLKML(source) {
             const chunk = messages.slice(start, start + batchSize);
             const chunkArticles = await mapWithConcurrency(chunk, concurrency, async (msg) => {
                 console.log(`[Fetcher] LKML - 处理补丁: ${msg.title.substring(0, 50)}...`);
-                const patchDetails = await fetchLkmlPatchDetails(msg.url, headers, timeoutMs);
+                const patchDetails = await fetchLkmlPatchDetailsBrowser(browser, msg.url, timeoutMs);
                 const content = [
                     `补丁标题: ${msg.title}`,
                     `补丁链接: ${msg.url}`,
@@ -235,7 +411,7 @@ async function fetchLKML(source) {
                         ? patchDetails.changedFiles.map(f => `- ${f}`).join('\n')
                         : '- 未解析到修改文件',
                 ].join('\n');
-                const type = (0, ai_1.inferPatchTypeRuleBased)(msg.title, content);
+                const type = (0, ai_1.inferPatchTypeRuleBased)(msg.title, patchDetails.commitMessage || '');
                 const patchData = {
                     id: `patch_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
                     title: msg.title,
@@ -243,10 +419,11 @@ async function fetchLKML(source) {
                     author: msg.author,
                     date: patchDetails.sentAt || msg.date,
                     content,
-                    subsystem: 'other',
+                    subsystem: (0, subsystem_1.inferKernelSubsystem)({ title: msg.title, files: patchDetails.changedFiles }),
                     type,
                     highlight: false,
                     summary: '',
+                    changedFiles: patchDetails.changedFiles,
                     messages: [msg],
                     replyCount: 0,
                 };
@@ -269,22 +446,10 @@ async function fetchLKML(source) {
         console.error(`LKML抓取失败 [${source.name}]:`, error);
         return [];
     }
-}
-function inferSubsystemFromFiles(files) {
-    const patterns = {
-        'sched': /\/sched\/|\/kernel\/sched/,
-        'mm': /\/mm\/|\/include\/linux\/mm\.h/,
-        'fs': /\/fs\/|\/include\/linux\/fs\.h/,
-        'net': /\/net\/|\/include\/linux\/net/,
-        'driver': /\/drivers\//,
-        'security': /\/security\/|\/include\/linux\/security/,
-        'arch': /\/arch\//,
-    };
-    for (const [subsystem, pattern] of Object.entries(patterns)) {
-        if (files.some(f => pattern.test(f)))
-            return subsystem;
+    finally {
+        await browser.close();
+        console.log('[Fetcher] 浏览器已关闭');
     }
-    return 'other';
 }
 async function fetchGitRepo(source) {
     const gitConfig = source.gitConfig;
@@ -338,7 +503,7 @@ async function fetchGitRepo(source) {
                 `统计: +${additions} -${deletions}`
             ].filter(Boolean).join('\n');
             const type = (0, ai_1.inferPatchTypeRuleBased)(title, content);
-            const subsystem = inferSubsystemFromFiles(files);
+            const subsystem = (0, subsystem_1.inferKernelSubsystem)({ title, files });
             const gitCommitData = {
                 hash,
                 shortHash,
@@ -397,7 +562,12 @@ async function fetchAll() {
             }
             console.log(`[Fetcher] ${source.name} 完成，获取 ${articles.length} 条记录`);
             console.log(`[AI] 正在生成 ${source.name} 摘要...`);
-            const summary = await (0, ai_1.generateSummary)(articles, source.summaryPrompt);
+            const summary = await (0, ai_1.generateSummary)(articles, {
+                subsystemPrompt: config.subsystemPrompt,
+                overallPrompt: config.overallPrompt,
+                subsystemSummaryConcurrency: config.subsystemSummaryConcurrency,
+                fixedSubsystemRules: config.fixedSubsystemRules,
+            });
             const sourceDayData = {
                 date: todayStr,
                 sourceName: source.name,

@@ -1,6 +1,7 @@
 import axios from 'axios'
 import * as cheerio from 'cheerio'
 import simpleGit from 'simple-git'
+import puppeteer, { type Browser } from 'puppeteer-core'
 import { 
   loadSourcesConfig,
   getTodayString,
@@ -18,6 +19,119 @@ import {
   inferPatchTypeRuleBased,
 } from './ai'
 import { inferKernelSubsystem } from './subsystem'
+
+const CHROME_PATHS_WIN = [
+  process.env.CHROME_PATH,
+  'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
+  'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
+  process.env.LOCALAPPDATA + '\\Google\\Chrome\\Application\\chrome.exe',
+  'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe',
+  'C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe',
+  process.env.LOCALAPPDATA + '\\Microsoft\\Edge\\Application\\msedge.exe',
+]
+
+const CHROME_PATHS_MAC = [
+  process.env.CHROME_PATH,
+  '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+  '/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge',
+]
+
+const CHROME_PATHS_LINUX = [
+  process.env.CHROME_PATH,
+  '/usr/bin/google-chrome',
+  '/usr/bin/chromium-browser',
+  '/usr/bin/chromium',
+  '/usr/bin/microsoft-edge',
+  '/usr/bin/microsoft-edge-stable',
+]
+
+function findChromePath(): string | null {
+  const paths = process.platform === 'win32' ? CHROME_PATHS_WIN
+    : process.platform === 'darwin' ? CHROME_PATHS_MAC
+    : CHROME_PATHS_LINUX
+  const fs = require('fs')
+  for (const p of paths) {
+    if (p && fs.existsSync(p)) return p
+  }
+  return null
+}
+
+async function launchBrowser(): Promise<Browser | null> {
+  const chromePath = findChromePath()
+  if (!chromePath) {
+    console.error('[Fetcher] 未找到 Chrome/Edge 浏览器，请设置 CHROME_PATH 环境变量')
+    return null
+  }
+  console.log(`[Fetcher] 使用浏览器: ${chromePath}`)
+  try {
+    const browser = await puppeteer.launch({
+      executablePath: chromePath,
+      headless: false,
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-blink-features=AutomationControlled',
+      ],
+      defaultViewport: null,
+    })
+    console.log('[Fetcher] 浏览器已启动')
+    return browser
+  } catch (err) {
+    console.error('[Fetcher] 启动浏览器失败:', err)
+    return null
+  }
+}
+
+async function fetchPageWithBrowser(
+  browser: Browser,
+  url: string,
+  waitForSelector: string,
+  timeoutMs: number = 60000
+): Promise<string> {
+  const page = await browser.newPage()
+  try {
+    await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36')
+    await page.setExtraHTTPHeaders({ 'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8' })
+    await page.evaluateOnNewDocument(`Object.defineProperty(navigator, 'webdriver', { get: () => false })`)
+
+    console.log(`[Fetcher] 浏览器访问: ${url}`)
+    await page.goto(url, { waitUntil: 'networkidle2', timeout: timeoutMs })
+
+    const maxWait = 90000
+    const deadline = Date.now() + maxWait
+    while (Date.now() < deadline) {
+      try {
+        const hasTarget = await page.evaluate(
+          `!!document.querySelector('${waitForSelector.replace(/'/g, "\\'")}')`
+        )
+        if (hasTarget) {
+          console.log('[Fetcher] 目标内容已加载')
+          break
+        }
+      } catch {
+        // page navigated, re-wait for load
+        try {
+          await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 30000 })
+        } catch {}
+      }
+
+      const isChallenge = await page.evaluate(
+        `document.body?.textContent?.includes('Anubis') || document.body?.textContent?.includes('工作量证明') || document.body?.textContent?.includes('Proof-of-Work') || document.title?.includes('确认')`
+      ).catch(() => false)
+
+      if (isChallenge) {
+        console.log('[Fetcher] 检测到 Anubis 挑战页面，等待挑战完成...')
+      }
+
+      await new Promise(r => setTimeout(r, 3000))
+    }
+
+    const html = await page.content()
+    return html
+  } finally {
+    await page.close()
+  }
+}
 
 function buildLkmlDayPageUrl(baseUrl: string, day: Date): string {
   return new URL(
@@ -202,6 +316,43 @@ async function fetchLkmlPatchDetails(
   return { commitMessage: '', changedFiles: [], sentAt: null }
 }
 
+async function fetchLkmlPatchDetailsBrowser(
+  browser: Browser,
+  patchUrl: string,
+  timeoutMs: number
+): Promise<{ commitMessage: string; changedFiles: string[]; sentAt: string | null }> {
+  try {
+    const html = await fetchPageWithBrowser(browser, patchUrl, 'pre', 60000)
+    const $ = cheerio.load(html)
+    const preTexts = $('pre')
+      .toArray()
+      .map(el => $(el).text())
+      .map(t => (t || '').trim())
+      .filter(Boolean)
+
+    const scorePre = (t: string) => {
+      let s = 0
+      if (/\bdiff --git\b/i.test(t)) s += 50
+      if (/^---\s+a\//m.test(t) && /^\+\+\+\s+b\//m.test(t)) s += 30
+      if (/^Signed-off-by:/mi.test(t)) s += 10
+      if (t.length > 4000) s += 5
+      return s
+    }
+
+    const rawPatchText = (preTexts.sort((a, b) => scorePre(b) - scorePre(a))[0] || '').trim()
+    const parsed = parseLkmlPatchText(rawPatchText)
+    const dateRow = $('tr').filter((_, tr) => {
+      const firstCell = $(tr).find('th, td').first().text().replace(/\s+/g, ' ').trim()
+      return firstCell === 'Date'
+    }).first()
+    const dateText = dateRow.find('td').last().text().replace(/\s+/g, ' ').trim()
+    return { ...parsed, sentAt: parseDateTextToIso(dateText) }
+  } catch (error) {
+    console.error(`[Fetcher] LKML - 获取补丁详情失败(浏览器): ${patchUrl}`, error)
+    return { commitMessage: '', changedFiles: [], sentAt: null }
+  }
+}
+
 async function mapWithConcurrency<T, R>(
   items: T[],
   limit: number,
@@ -223,15 +374,20 @@ async function mapWithConcurrency<T, R>(
 
 async function fetchLKML(source: Source): Promise<Article[]> {
   const excludeAuthors = source.excludeAuthors || []
-  const concurrency = source.lkmlDetailConcurrency ?? 12
-  const timeoutMs = source.lkmlDetailTimeoutMs ?? 8000
+  const concurrency = Math.min(source.lkmlDetailConcurrency ?? 4, 4)
+  const timeoutMs = source.lkmlDetailTimeoutMs ?? 15000
+
+  const browser = await launchBrowser()
+  if (!browser) {
+    console.error('[Fetcher] LKML - 无法启动浏览器，跳过抓取')
+    return []
+  }
 
   try {
     const today = new Date()
     const yesterday = new Date(today)
     yesterday.setDate(yesterday.getDate() - 1)
 
-    const headers = { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' }
     const messages: LKMLMessage[] = []
     const seenUrls = new Set<string>()
 
@@ -241,8 +397,8 @@ async function fetchLKML(source: Source): Promise<Article[]> {
     ]) {
       console.log(`[Fetcher] LKML - 正在访问 (${label}): ${url}`)
       try {
-        const response = await axios.get(url, { headers, timeout: 10000 })
-        collectLkmlPatchMessagesFromHtml(response.data, source, excludeAuthors, seenUrls, messages, label)
+        const html = await fetchPageWithBrowser(browser, url, 'table.mh', 90000)
+        collectLkmlPatchMessagesFromHtml(html, source, excludeAuthors, seenUrls, messages, label)
       } catch (pageErr) {
         console.error(`[Fetcher] LKML (${label}) 页面抓取失败:`, pageErr)
       }
@@ -256,7 +412,7 @@ async function fetchLKML(source: Source): Promise<Article[]> {
       const chunk = messages.slice(start, start + batchSize)
       const chunkArticles = await mapWithConcurrency(chunk, concurrency, async (msg) => {
         console.log(`[Fetcher] LKML - 处理补丁: ${msg.title.substring(0, 50)}...`)
-        const patchDetails = await fetchLkmlPatchDetails(msg.url, headers, timeoutMs)
+        const patchDetails = await fetchLkmlPatchDetailsBrowser(browser, msg.url, timeoutMs)
         
         const content = [
           `补丁标题: ${msg.title}`,
@@ -271,7 +427,6 @@ async function fetchLKML(source: Source): Promise<Article[]> {
             : '- 未解析到修改文件',
         ].join('\n')
 
-        // 分类应同时基于标题与 commit message（不要被文件列表等噪声干扰）
         const type = inferPatchTypeRuleBased(msg.title, patchDetails.commitMessage || '')
 
         const patchData: LKMLPatch = {
@@ -310,6 +465,9 @@ async function fetchLKML(source: Source): Promise<Article[]> {
   } catch (error) {
     console.error(`LKML抓取失败 [${source.name}]:`, error)
     return []
+  } finally {
+    await browser.close()
+    console.log('[Fetcher] 浏览器已关闭')
   }
 }
 
