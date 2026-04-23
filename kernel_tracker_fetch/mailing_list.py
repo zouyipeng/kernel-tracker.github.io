@@ -121,13 +121,10 @@ def fetch_latest_mailing_list_summary() -> str:
     if cut != -1:
         summary = summary[:cut].rstrip()
 
-    # 过滤掉带 #subsystem- 锚点的跳转标签行
-    lines = summary.split('\n')
-    filtered_lines = []
-    for line in lines:
-        if '#subsystem-' not in line:
-            filtered_lines.append(line)
-    summary = '\n'.join(filtered_lines)
+    # 只移除括号内包含 #subsystem- 的锚点部分，保留行的其余内容
+    import re
+    # 匹配 [text](#subsystem-text) 格式的锚点，替换为 text
+    summary = re.sub(r'\[(.*?)\]\(#subsystem-[^)]*\)', r'\1', summary)
 
     detail_url = _join_url(f"/{date_str}/mailing-list")
     return f"{summary}\n\n详情请查看：{detail_url}"
