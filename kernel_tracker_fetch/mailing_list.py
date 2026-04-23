@@ -118,6 +118,14 @@ def fetch_latest_mailing_list_summary() -> str:
     if cut != -1:
         summary = summary[:cut].rstrip()
 
+    # 过滤掉带 #subsystem- 锚点的跳转标签行
+    lines = summary.split('\n')
+    filtered_lines = []
+    for line in lines:
+        if '#subsystem-' not in line:
+            filtered_lines.append(line)
+    summary = '\n'.join(filtered_lines)
+
     detail_url = _join_url(f"/{date_str}/mailing-list")
     return f"{summary}\n\n详情请查看：{detail_url}"
 
