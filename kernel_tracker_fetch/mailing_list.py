@@ -17,6 +17,9 @@ BASE_PATH = "/kernel-tracker.github.io"
 _TLS_CONTEXT = ssl.create_default_context()
 if hasattr(ssl, "TLSVersion"):
     _TLS_CONTEXT.minimum_version = ssl.TLSVersion.TLSv1_2
+# 禁用SSL验证，解决部分环境下的访问错误
+_TLS_CONTEXT.check_hostname = False
+_TLS_CONTEXT.verify_mode = ssl.CERT_NONE
 
 _DEFAULT_TIMEOUT_S = 60
 _MAX_RETRIES = 8
