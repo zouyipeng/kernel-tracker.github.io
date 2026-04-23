@@ -127,7 +127,7 @@ def fetch_latest_mailing_list_summary() -> str:
     summary = re.sub(r'\[(.*?)\]\(#subsystem-[^)]*\)', r'\1', summary)
 
     detail_url = _join_url(f"/{date_str}/mailing-list")
-    return f"{summary}\n\n详情请查看：{detail_url}"
+    return f"{summary}\n详情请查看：{detail_url}"
 
 
 def main() -> int:
