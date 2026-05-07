@@ -47,3 +47,6 @@ backend/config*.json
 
 # Trae
 .trae/
+
+#python
+*/__pycache__/
