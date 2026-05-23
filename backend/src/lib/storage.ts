@@ -9,6 +9,7 @@ export interface GitConfig {
   sinceDays: number
   maxCommits: number
   localPath?: string
+  timeoutMs?: number // 仓库抓取超时（毫秒），默认 120000
 }
 
 export interface Source {
