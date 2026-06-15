@@ -43,7 +43,7 @@ next-env.d.ts
 *.swo
 
 # config with secrets
-backend/config*.json
+backend/config*.json*
 
 # Trae
 .trae/
