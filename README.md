@@ -112,9 +112,6 @@ npm run build
 
 # 启动静态服务器
 npx serve out
-
-# 一键部署
-npm run all
 ```
 
 ### GitHub Pages（Project Pages）部署
@@ -134,10 +131,6 @@ cd backend
 
 # 全量抓取所有信息源
 npm run fetch -- all
-
-# 为指定信息源重新生成摘要
-npm run fetch -- summary --source "Mailing List"
-npm run fetch -- summary --source "Mainline" --date 2026-03-25
 
 # 查看帮助
 npm run fetch -- help
