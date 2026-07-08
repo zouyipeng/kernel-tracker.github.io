@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import datetime
 import json
 import socket
 import ssl
@@ -110,6 +111,12 @@ def fetch_latest_mailing_list_summary() -> str:
     date_str = str(dates[0])
     if not date_str or len(date_str) != 10:
         raise RuntimeError(f'Invalid latest date "{date_str}" from {index_url}')
+
+    # 校验是否为当天日期，非当天则返回空
+    today = datetime.date.today().isoformat()  # YYYY-MM-DD
+    if date_str != today:
+        return ""
+
     data_url = _join_url(f"/mailing-list-{date_str}.json")
     data: Dict[str, Any] = _http_get_json(data_url)
 
