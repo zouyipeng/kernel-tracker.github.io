@@ -451,16 +451,29 @@ async function fetchLKML(source) {
         console.log('[Fetcher] 浏览器已关闭');
     }
 }
+async function withTimeout(promise, timeoutMs, label) {
+    let timeoutId;
+    const timeoutPromise = new Promise((_, reject) => {
+        timeoutId = setTimeout(() => reject(new Error(`[Timeout] ${label} (${timeoutMs}ms)`)), timeoutMs);
+    });
+    try {
+        return await Promise.race([promise, timeoutPromise]);
+    }
+    finally {
+        clearTimeout(timeoutId);
+    }
+}
 async function fetchGitRepo(source) {
     const gitConfig = source.gitConfig;
     if (!gitConfig?.localPath) {
         console.error(`[Fetcher] Git - 缺少 localPath 配置: ${source.name}`);
         return [];
     }
+    const fetchTimeoutMs = gitConfig.timeoutMs ?? 120000; // 默认 2 分钟
     try {
         console.log(`[Fetcher] Git - 正在读取仓库: ${gitConfig.localPath}`);
         const git = (0, simple_git_1.default)(gitConfig.localPath);
-        if (!await git.checkIsRepo()) {
+        if (!await withTimeout(git.checkIsRepo(), 30000, `检查仓库: ${source.name}`)) {
             console.error(`[Fetcher] Git - 不是有效的 Git 仓库: ${gitConfig.localPath}`);
             return [];
         }
@@ -469,8 +482,8 @@ async function fetchGitRepo(source) {
         const sinceDate = new Date();
         sinceDate.setDate(sinceDate.getDate() - sinceDays);
         const sinceStr = sinceDate.toISOString().split('T')[0];
-        console.log(`[Fetcher] Git - 时间范围: ${sinceStr} 至今, 最大提交数: ${maxCommits}`);
-        const logResult = await git.log(['--since', sinceStr, '--no-merges', `-${maxCommits}`]);
+        console.log(`[Fetcher] Git - 时间范围: ${sinceStr} 至今, 最大提交数: ${maxCommits}, 超时: ${fetchTimeoutMs}ms`);
+        const logResult = await withTimeout(git.log(['--since', sinceStr, '--no-merges', `-${maxCommits}`]), fetchTimeoutMs, `git.log: ${source.name}`);
         console.log(`[Fetcher] Git - 获取到 ${logResult.all.length} 个提交`);
         const articles = [];
         for (const commit of logResult.all) {
@@ -484,12 +497,14 @@ async function fetchGitRepo(source) {
             let additions = 0;
             let deletions = 0;
             try {
-                const diffResult = await git.diffSummary([`${hash}^`, hash]);
+                const diffResult = await withTimeout(git.diffSummary([`${hash}^`, hash]), 30000, `git.diffSummary: ${shortHash}`);
                 files = diffResult.files.map(f => f.file);
                 additions = diffResult.insertions || 0;
                 deletions = diffResult.deletions || 0;
             }
-            catch { }
+            catch {
+                // 单个 diff 超时不影响整体，继续处理下一个 commit
+            }
             const content = [
                 `提交: ${shortHash}`,
                 `作者: ${author} <${authorEmail}>`,
@@ -533,7 +548,12 @@ async function fetchGitRepo(source) {
         return articles.sort((a, b) => new Date(b.gitCommitData?.date || 0).getTime() - new Date(a.gitCommitData?.date || 0).getTime());
     }
     catch (error) {
-        console.error(`Git抓取失败 [${source.name}]:`, error);
+        if (error.message?.includes('[Timeout]')) {
+            console.warn(`[Fetcher] Git - 仓库抓取超时已跳过 [${source.name}]: ${error.message}`);
+        }
+        else {
+            console.error(`Git抓取失败 [${source.name}]:`, error);
+        }
         return [];
     }
 }

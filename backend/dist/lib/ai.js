@@ -16,7 +16,10 @@ let config = {
         apiKey: '',
         baseURL: 'https://api.openai.com/v1',
         model: 'gpt-3.5-turbo',
-        maxTokens: 4096
+        // 393216 = deepseek-flash (DeepSeek-V4.1-Flash) 的 max_output_tokens 上限。
+        // 注意：1M(1048576) 是上下文窗口，不是输出上限，填 1M 会被 API 以
+        // "Invalid max_tokens value, the valid range of max_tokens is [1, 393216]" 拒绝。
+        maxTokens: 393216
     }
 };
 if (fs_1.default.existsSync(configPath)) {
@@ -535,7 +538,9 @@ async function summarizeUnmatchedScopeAI(input) {
         return await openai.chat.completions.create({
             model: config.openai.model,
             messages,
-            max_tokens: 300,
+            // 改为跟随 config.openai.maxTokens（原先硬编码 300，推理模型会把额度全花在
+            // reasoning_content 上导致 content 返回空，Other 段静默缺失）
+            max_tokens: config.openai.maxTokens,
             temperature: 0.4,
         });
     }, '生成未匹配子系统概览');
