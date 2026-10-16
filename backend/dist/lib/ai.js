@@ -143,6 +143,28 @@ function normalizeLineTags(line) {
     const label = `${hasPerf ? '`perf` ' : ''}\`${mainType}\``.trim();
     return `${label} ${rest}`.trim();
 }
+// 模型很容易把每条都写成「…。该改动重要在于…；点评：…」这种填空句，整篇一个骨架，
+// 读起来极其疲劳。提示词里已明令禁止，这里再兜底剥掉残留的固定句式与空泛评价。
+const BOILERPLATE_REWRITES = [
+    [/(该|此|本次|这一)?改动(的)?(重要|意义|价值)(性)?(在于|是)[：:，,]?\s*/g, ''],
+    [/(重要|意义|关键)(在于|是)[：:，,]?\s*/g, ''],
+    [/[；;，,]?\s*点评[：:]\s*/g, '；'],
+    [/(值得|建议)(持续|重点)?关注[。，,；;]?/g, ''],
+    [/(整体)?风险(较|很|也)?低[。，,；;]?/g, ''],
+    [/属于[^。；;]{0,20}的(改进|增强|维护|投入|补充|提升)[。，,；;]?/g, ''],
+    [/无突出(的)?(性能|特性|功能)[^。；;]{0,20}[。，,；;]?/g, ''],
+];
+function stripBoilerplate(block) {
+    let out = block || '';
+    for (const [re, to] of BOILERPLATE_REWRITES)
+        out = out.replace(re, to);
+    return out
+        // 剥掉固定句式后常留下重复标点/悬空空格，这里收口
+        .replace(/[。；;]\s*[。；;，,]/g, '。')
+        .replace(/[（(]\s*[）)]/g, '')
+        .replace(/[ \t]{2,}/g, ' ')
+        .replace(/[ \t]+([。，,；;：:）)])/g, '$1');
+}
 function normalizeSummaryTagLines(block) {
     return (block || '')
         .split('\n')
@@ -254,7 +276,7 @@ function applySourceTags(block, articles) {
             continue;
         const title = a.patchData?.title || a.gitCommitData?.title || a.title;
         const content = a.patchData?.content || a.gitCommitData?.content || a.content || '';
-        byUrl.set(url, { type: getArticleType(a), perf: detectPerfRelated(`${title}\n${content}`) });
+        byUrl.set(url, { type: getArticleType(a), perf: detectPerfRelated(patchSignalText(title, content)) });
     }
     return (block || '')
         .split('\n')
@@ -281,7 +303,21 @@ function applySourceTags(block, articles) {
 // 全段均为 `other` 且条目足够多时，说明该子系统当天确实只有次要改动，
 // 折叠成一行概览避免刷屏；条目不多时保留原描述，不做折叠。
 const COLLAPSE_OTHER_MIN_ITEMS = 6;
-function reorderAndCollapseSubsystemLines(block) {
+// 单个子系统逐条展开的上限，超出的部分折成一行「另有 N 项」。
+const DEFAULT_SUBSYSTEM_MAX_ITEMS = 10;
+// 折叠行里最多挂多少个链接，太多就只是刷屏。
+const MAX_FOLDED_LINKS = 12;
+function renderLinks(links) {
+    const uniq = [];
+    for (const u of links) {
+        if (u && !uniq.includes(u))
+            uniq.push(u);
+    }
+    const shown = uniq.slice(0, MAX_FOLDED_LINKS);
+    const suffix = uniq.length > shown.length ? ` 等 ${uniq.length} 项` : '';
+    return `${shown.map(u => `[↗](${u})`).join(' ')}${suffix}`;
+}
+function reorderAndCollapseSubsystemLines(block, maxItems = DEFAULT_SUBSYSTEM_MAX_ITEMS) {
     const lines = (block || '')
         .split('\n')
         .map(l => l.trim())
@@ -291,13 +327,14 @@ function reorderAndCollapseSubsystemLines(block) {
         const tags = extractTags(text);
         return { raw: text, ...tags, links: extractLinks(text), idx };
     });
-    const orderType = { feature: 1, bugfix: 2, other: 3 };
+    // 排序即优先级：perf > bugfix > feature > other。
+    // 这里按「风险/收益」排而不是按类型字母序，是因为超出上限的尾部会被折叠掉——
+    // 若把 feature 排在 bugfix 前面，折叠时丢掉的会是一整批回归修复。
+    const orderType = { bugfix: 1, feature: 2, other: 3 };
     items.sort((a, b) => {
-        // 子系统内严格排序：
         // 1) perf 优先
-        // 2) 在 perf 组内仍保持 feature -> bugfix -> other 的相对顺序
-        // 3) 非 perf 组同样 feature -> bugfix -> other
-        // 4) 同组同类型保持原始顺序（稳定）
+        // 2) 组内按 bugfix -> feature -> other
+        // 3) 同组同类型保持原始顺序（稳定）
         const pa = a.hasPerf ? 0 : 1;
         const pb = b.hasPerf ? 0 : 1;
         if (pa !== pb)
@@ -310,29 +347,43 @@ function reorderAndCollapseSubsystemLines(block) {
     });
     const otherItems = items.filter(i => i.type === 'other');
     const nonOther = items.filter(i => i.type !== 'other');
-    // 仅当该子系统当天全是次要改动、且条目足够多时才折叠；其余情况逐条保留描述，
-    // 避免混在 feature/bugfix 之间的少量 other 条目被替换成一行链接。
-    const collapseOther = nonOther.length === 0 && otherItems.length >= COLLAPSE_OTHER_MIN_ITEMS;
-    const outLines = [];
-    for (const it of nonOther) {
-        outLines.push(`- ${it.raw}`);
+    // 全是次要改动且条目足够多：整块折成一行，一个描述都不展开。
+    if (nonOther.length === 0 && otherItems.length >= COLLAPSE_OTHER_MIN_ITEMS) {
+        return (`- \`other\` 本日另有 ${otherItems.length} 项次要改动（清理、文档、小修正等），详见：` +
+            renderLinks(otherItems.flatMap(i => i.links))).trim();
     }
-    if (collapseOther) {
-        const links = otherItems.flatMap(i => i.links).filter(Boolean);
-        const uniqLinks = [];
-        for (const u of links) {
-            if (!uniqLinks.includes(u))
-                uniqLinks.push(u);
-        }
-        const linkText = uniqLinks.map(u => `[↗](${u})`).join(' ');
-        outLines.push(`- \`other\` 该子系统当日 ${otherItems.length} 项改动多为小修正、清理或配置更新，整体风险较低，详情见：${linkText}`.trim());
-    }
-    else {
-        for (const it of otherItems) {
-            outLines.push(`- ${it.raw}`);
-        }
+    const limit = Math.max(1, maxItems);
+    const kept = items.slice(0, limit);
+    const folded = items.slice(limit);
+    const outLines = kept.map(it => `- ${it.raw}`);
+    if (folded.length > 0) {
+        // 折叠行只留纯事实：多少项 + 链接，不做任何评价
+        outLines.push(`- 另有 ${folded.length} 项改动，详见：${renderLinks(folded.flatMap(i => i.links))}`.trim());
     }
     return outLines.join('\n').trim();
+}
+// `feature` 是当天的基线，绝大多数条目都是它——逐条打标等于没打标，反而把真正需要一眼看到的
+// `perf` / `bugfix` 淹掉。这里在排序/折叠都完成之后，只去掉 `feature` 标记，
+// 保留 `perf`、`bugfix` 与表示「次要改动」的 `other`。
+// 只认行首那一串带反引号的标记（`perf` `feature` ...），避免误删正文里的 "feature" 一词。
+const LEADING_TAG_RUN_RE = /^(?:`(?:feature|bugfix|other|perf)`[\s:：|]*)+/i;
+function dropFeatureLabels(block) {
+    return (block || '')
+        .split('\n')
+        .map(line => {
+        const m = line.match(/^(\s*[-*]\s+)?(.*)$/);
+        if (!m)
+            return line;
+        const prefix = m[1] || '';
+        const rest = (m[2] || '')
+            .replace(LEADING_TAG_RUN_RE, run => run.replace(/`feature`[\s:：|]*/gi, ''))
+            .trim();
+        if (!rest)
+            return line;
+        return `${prefix}${rest}`;
+    })
+        .join('\n')
+        .trim();
 }
 function computeArticleDateRange(articles) {
     let minTs = Number.POSITIVE_INFINITY;
@@ -437,6 +488,14 @@ async function generateCategorySummary(articles, type, customPrompt) {
     summary = summary.trim();
     return summary;
 }
+// 类型/perf 判定只看标题与 commit message 正文：传给模型的 content 里还拼着「修改的文件」
+// 列表，而 LKML 页面上没有 diff 时它甚至可能是整段 patch。拿全文去匹配关键词会大量误标
+// （例如 `\b(qps|pps|fps)\b` 命中了无关缩写，把一块 RGB LED 驱动标成 perf）。
+function patchSignalText(title, content) {
+    const head = (content || '').split(/\n修改的文件[:：]/)[0];
+    const idx = head.indexOf('Commit message:');
+    return `${title}\n${idx >= 0 ? head.slice(idx + 'Commit message:'.length) : head}`.trim();
+}
 function detectPerfRelated(text) {
     const lower = (text || '').toLowerCase();
     if (!lower)
@@ -467,7 +526,7 @@ function buildSubsystemInputLines(articles) {
         const date = a.patchData?.date || a.gitCommitData?.date || a.fetchedAt || '';
         const files = a.patchData?.changedFiles || a.gitCommitData?.files || [];
         const content = a.patchData?.content || a.gitCommitData?.content || a.content || '';
-        const perf = detectPerfRelated(`${title}\n${content}`) ? 'perf' : '';
+        const perf = detectPerfRelated(patchSignalText(title, content)) ? 'perf' : '';
         const url = a.patchData?.url || a.gitCommitData?.url || a.url || `#${lkmlAnchorFragmentId(a.id)}`;
         const filesShort = files.length > 0 ? files.slice(0, 12).join(', ') + (files.length > 12 ? ', ...' : '') : '';
         lines.push([
@@ -499,8 +558,8 @@ async function mapWithConcurrency(items, concurrency, mapper) {
     await Promise.all(workers);
     return out;
 }
-async function summarizeSubsystem(subsystem, subsystemArticles, prompt) {
-    const defaultPrompt = '你是 Linux 内核开发专家。现在只分析单个子系统下的补丁/提交动态。\n\n输出要求：\n- 用中文\n- 不要输出思考过程\n- 不要输出任何 Markdown 标题\n- 逐条输出该子系统的具体改动，每条单独一行\n- 每条必须包含：`feature`/`bugfix`/`other` 标记；若为性能优化/性能相关需额外标注 `perf`\n- 每条行末必须包含补丁/提交的原始链接，格式为 [↗](https://...)\n- 不要原样复述 title；改为“做了什么/为什么重要”的描述\n';
+async function summarizeSubsystem(subsystem, subsystemArticles, prompt, maxItems) {
+    const defaultPrompt = '你是 Linux 内核开发专家。现在只分析单个子系统下的补丁/提交动态。\n\n输出要求：\n- 用中文\n- 不要输出思考过程\n- 不要输出任何 Markdown 标题\n- 逐条输出该子系统的具体改动，每条单独一行；一个补丁/提交一条，不要合并成一条\n- 每条控制在 80 字以内，只说清「改了什么 + 带来什么影响或收益」\n- 每条必须包含：`feature`/`bugfix`/`other` 标记；若为性能优化/性能相关需额外标注 `perf`\n- 每条行末必须包含补丁/提交的原始链接，格式为 [↗](https://...)\n- 不要原样复述 title，也不要写固定句式的评价：禁止「该改动重要在于」「点评：」「值得关注」「整体风险低」「属于……的改进」\n- 除非确有兼容性、ABI 或安全风险需要提醒，不要额外加一句评价\n';
     const systemPrompt = (prompt || defaultPrompt).trim();
     const messages = [
         { role: 'system', content: systemPrompt },
@@ -520,9 +579,10 @@ async function summarizeSubsystem(subsystem, subsystemArticles, prompt) {
         });
     }, `生成子系统摘要 - ${subsystem}`);
     const rawContent = result.choices[0]?.message?.content || '';
-    const normalized = normalizeOneItemPerLine(normalizeSummaryTagLines(cleanAIResponse(rawContent))).trim();
+    const normalized = normalizeOneItemPerLine(normalizeSummaryTagLines(stripBoilerplate(cleanAIResponse(rawContent)))).trim();
     const tagged = applySourceTags(normalized, subsystemArticles);
-    return reorderAndCollapseSubsystemLines(tagged).trim();
+    const ordered = reorderAndCollapseSubsystemLines(tagged, maxItems);
+    return dropFeatureLabels(ordered);
 }
 // Make subsystem names clickable to jump to corresponding detail blocks.
 // Frontend cards use: id="subsystem-${encodeURIComponent(title)}"
@@ -547,23 +607,40 @@ function wrapSubsystemLinks(cleaned, subsystems) {
             out.push(`${prefix}${rest}`);
             continue;
         }
-        // Replace the first matching "<icon> <subsystem>：" or "<subsystem>："
+        // 新格式：行末的 （<子系统>）；旧格式：行首的 <图标> <子系统>：
+        // 两种都做链接化，保证自定义 overallPrompt 用旧格式时也不会退化。
+        // 同一行可能两种都出现（模型偶尔两头都写），所以不提前 break。
         for (const s of subsystems) {
             const esc = s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-            const re = new RegExp(`(^|\\s)(${esc})(\\s*：)`);
-            if (re.test(rest)) {
-                rest = rest.replace(re, (_all, p1, p2, p3) => `${p1}[${p2}](${toId(s)})${p3}`);
-                break;
+            const colonRe = new RegExp(`(^|\\s)(${esc})(\\s*：)`);
+            const parenRe = new RegExp(`([（(])\\s*(${esc})\\s*([）)])`);
+            let hit = false;
+            if (colonRe.test(rest)) {
+                rest = rest.replace(colonRe, (_all, p1, p2, p3) => `${p1}[${p2}](${toId(s)})${p3}`);
+                hit = true;
             }
+            if (parenRe.test(rest)) {
+                rest = rest.replace(parenRe, (_all, p1, p2, p3) => `${p1}[${p2}](${toId(s)})${p3}`);
+                hit = true;
+            }
+            if (hit)
+                break;
         }
         out.push(`${prefix}${rest}`);
     }
     return out;
 }
-// 拆分总览行：`- 🧠 [Memory](#subsystem-Memory)：正文` -> { label: '🧠 Memory', body: '正文' }
-function splitOverviewLine(line) {
+// 拆分总览行，兼容两种格式：
+//   旧：`- 🧠 [Memory](#subsystem-Memory)：正文`      -> { label: '🧠 Memory', body: '正文' }
+//   新：`- ⚡ 正文（[Memory](#subsystem-Memory)）`      -> { label: 'Memory', body: '⚡ 正文' }
+// 新格式只在括号内容确实是已知子系统时才当标签，避免把正文里的普通括号误判成子系统。
+function splitOverviewLine(line, subsystems = []) {
     const t = (line || '').trim().replace(/^[-*]\s+/, '');
     const plain = t.replace(/!?\[([^\]]*)\]\([^)]*\)/g, '$1').replace(/[`*_~]/g, '');
+    const paren = plain.match(/^(.*?)[（(]\s*([^（）()]{1,40}?)\s*[）)]\s*$/);
+    if (paren && subsystems.includes(paren[2])) {
+        return { label: paren[2], body: paren[1].trim() };
+    }
     const idx = plain.search(/[：:]/);
     if (idx < 0)
         return { label: '', body: plain.trim() };
@@ -582,8 +659,8 @@ const EMPTY_DYNAMIC_PATTERNS = [
     /代码卫生/,
 ];
 const IDENTIFIER_RE = /[A-Za-z][A-Za-z0-9_.&-]+/;
-function isEmptyDynamicLine(line) {
-    const { body } = splitOverviewLine(line);
+function isEmptyDynamicLine(line, subsystems = []) {
+    const { body } = splitOverviewLine(line, subsystems);
     if (!body)
         return true;
     if (IDENTIFIER_RE.test(body))
@@ -616,14 +693,16 @@ function enforceOverviewBudget(lines, maxChars) {
     return out;
 }
 async function summarizeOverall(subsystemSummaries, prompt, maxChars = DEFAULT_SUMMARY_MAX_CHARS) {
-    const defaultPrompt = '你是 Linux 内核开发专家。你将收到多个子系统的条目式总结。\n\n输出要求：\n- 用中文\n- 不要输出思考过程\n- 不要输出任何 Markdown 标题\n- 输出 Markdown 无序列表，每个子系统 1 行，格式：<图标> <子系统>：<一句话点评>\n- 只保留最重要的动态，不要逐条重复子系统条目\n';
-    // 字数硬约束：直接追加到 prompt 后面，保证自定义 prompt 也生效。
-    const budgetRule = `\n\n【字数硬约束】总览正文（不含大标题）总字数必须 ≤ ${maxChars} 字，越精简越好：\n` +
-        '- 每个子系统只占一行，用一句话（约 20~40 字）说明「做了什么 + 收益/影响」\n' +
-        '- 只保留最重要的动态，次要修复、清理、统计数字、枚举罗列一律省略\n' +
-        '- 若某子系统本日只有清理、注释、配置更新或小修正等无实质动态，**整行省略**，\n' +
-        '  不要用「以清理…为主，无突出性能或特性变更，风险低」这类套话占位\n' +
-        '- 宁可少写，不可超字数';
+    const defaultPrompt = '你是 Linux 内核开发专家。你将收到多个子系统的条目式总结。\n\n输出要求：\n- 用中文\n- 不要输出思考过程\n- 不要输出任何 Markdown 标题\n- 输出 Markdown 无序列表，共 3~6 条，按重要性从高到低排序\n- 每条格式固定为：<图标> <一句话>（<子系统名>），子系统名必须与输入中的「## 子系统名」完全一致\n- 跨子系统挑当天全局最值得关注的动态，不要按子系统逐个铺开\n';
+    // 硬约束：直接追加到 prompt 后面，保证自定义 prompt 也生效。
+    const budgetRule = `\n\n【硬约束】\n` +
+        '- 全文 3~6 条，按重要性从高到低排序；宁可少于 6 条，也不要为凑数硬写\n' +
+        '- 每条一句话（不超过 70 字），只讲一个动态，不要把多个改动挤进同一条\n' +
+        '- 每条行末用中文括号标注子系统名，例如（Memory）；这个名字会被渲染成跳转到详情的链接，必须准确\n' +
+        '- 优先挑选：性能收益、新特性/新接口、安全修复、回归修复、有争议或有兼容性风险的改动\n' +
+        '- 禁止空话：「以清理为主」「风险较低」「值得关注」「属于……的改进」等；\n' +
+        '  某子系统当天没有实质动态就不要出现在总览里\n' +
+        `- 全文不超过 ${maxChars} 字`;
     const systemPrompt = `${(prompt || defaultPrompt).trim()}${budgetRule}`;
     const merged = subsystemSummaries
         .filter(s => s.summary.trim())
@@ -637,7 +716,7 @@ async function summarizeOverall(subsystemSummaries, prompt, maxChars = DEFAULT_S
         const retryRule = attempt === 1
             ? ''
             : `\n\n【重试】上一次输出为 ${countVisibleChars(lines.join('\n'))} 字，超出 ${maxChars} 字上限。` +
-                '请大幅压缩：合并同类项，每个子系统只留最关键的一点，删掉所有细节与次要项。';
+                '请大幅压缩：只保留最重要的 3 条，每条不超过 40 字，删掉所有细节与次要项。';
         const messages = [
             { role: 'system', content: `${systemPrompt}${retryRule}` },
             { role: 'user', content: merged || '（无子系统条目）' },
@@ -656,8 +735,8 @@ async function summarizeOverall(subsystemSummaries, prompt, maxChars = DEFAULT_S
         const kept = [];
         droppedLabels = [];
         for (const line of wrapSubsystemLinks(cleaned, subsystems)) {
-            if (isEmptyDynamicLine(line)) {
-                droppedLabels.push(splitOverviewLine(line).label || line.trim());
+            if (isEmptyDynamicLine(line, subsystems)) {
+                droppedLabels.push(splitOverviewLine(line, subsystems).label || line.trim());
             }
             else {
                 kept.push(line);
@@ -768,15 +847,18 @@ async function generateSummary(articles, promptOrOptions) {
     const concurrency = Math.max(1, options.subsystemSummaryConcurrency || 6);
     console.log(`[AI] 子系统数: ${subsystemEntries.length}，参与AI总结子系统: ${primarySubsystems.length}，子系统总结并发: ${concurrency}`);
     const subsystemSummaries = await mapWithConcurrency(primarySubsystems, concurrency, async (entry) => {
-        const summary = await summarizeSubsystem(entry.subsystem, entry.list, options.subsystemPrompt || options.summaryPrompt);
-        return { subsystem: entry.subsystem, summary };
+        const summary = await summarizeSubsystem(entry.subsystem, entry.list, options.subsystemPrompt || options.summaryPrompt, options.subsystemMaxItems);
+        return { subsystem: entry.subsystem, summary, articleCount: entry.list.length };
     });
     const overall = await summarizeOverall(subsystemSummaries, options.overallPrompt, options.summaryMaxChars ?? DEFAULT_SUMMARY_MAX_CHARS);
     const parts = [];
     parts.push(`# 今日社区动态（${model} | ${dateRange || '未知'}）`);
     parts.push('');
     parts.push(overall || `今日共收集到 ${articles.length} 条记录。`);
-    for (const s of subsystemSummaries) {
+    // 详情区按当天活跃度（条目数）排序，而不是固定的 config 顺序：
+    // 当天最热闹的子系统排在最前面，读者不用先翻过一片安静的板块。
+    const orderedSummaries = [...subsystemSummaries].sort((a, b) => b.articleCount - a.articleCount);
+    for (const s of orderedSummaries) {
         const body = s.summary.trim();
         if (!body)
             continue;
@@ -793,7 +875,7 @@ async function generateSummary(articles, promptOrOptions) {
                 totals[t]++;
                 const title = a.patchData?.title || a.gitCommitData?.title || a.title;
                 const content = a.patchData?.content || a.gitCommitData?.content || a.content || '';
-                if (detectPerfRelated(`${title}\n${content}`))
+                if (detectPerfRelated(patchSignalText(title, content)))
                     totals.perf++;
             }
         }
@@ -816,7 +898,7 @@ async function generateSummary(articles, promptOrOptions) {
             totals[t]++;
             const title = a.patchData?.title || a.gitCommitData?.title || a.title;
             const content = a.patchData?.content || a.gitCommitData?.content || a.content || '';
-            if (detectPerfRelated(`${title}\n${content}`))
+            if (detectPerfRelated(patchSignalText(title, content)))
                 totals.perf++;
         }
         parts.push('');
@@ -836,45 +918,63 @@ async function generateSummary(articles, promptOrOptions) {
     }
     return parts.join('\n').trim();
 }
+// 标题形如 "wifi: iwlwifi: mvm: fix a deadlock"：先剥掉 [PATCH v2 3/5] 这类标签，再剥掉
+// 任意层数的 "子系统:" 前缀，剩下的才是真正的动作描述。原先只剥一层前缀，多段前缀的补丁
+// （wifi: iwlwifi: mvm: fix ...）判不出 bugfix，只能落到正文启发式，于是被误标成 feature。
+function stripSubjectPrefixes(title) {
+    const t = (title || '').replace(/^\s*(?:\[[^\]]*\]\s*)+/, '').trim();
+    return t.replace(/^(?:[A-Za-z0-9_.+\/&-]+\s*:\s*)+/, '').trim();
+}
+// 正文只取首段：后面的 changelog、Signed-off-by、评审讨论里满是 add/support/enable，
+// 拿它们判 feature 会把大量修复误标成新特性。
+function firstParagraph(text) {
+    const t = (text || '').replace(/\r/g, '').trim();
+    if (!t)
+        return '';
+    const idx = t.search(/\n\s*\n/);
+    return (idx >= 0 ? t.slice(0, idx) : t).slice(0, 800);
+}
 function inferPatchTypeRuleBased(title, body) {
-    const combined = `${title}\n${body}`;
-    const lower = combined.toLowerCase();
-    const bugfixInSubject = /\[patch[^\]]*\]\s*[^:]+:\s*(fix|fixes)\b/i.test(title) ||
-        /^[^:]+:\s*(fix|fixes)\b/i.test(title.trim());
-    const bugfixInText = /\b(fix(es|ed|ing)?|fixes:)\b/.test(lower) ||
-        /\b(data\s+race|race\s+condition|kcsan)\b/.test(lower) ||
-        /\b(leak|memory\s+leak|refcount)\b/.test(lower) ||
-        /\b(crash|oops|panic|null\s*deref|null\s*pointer|use[-\s]after[-\s]free|\buaf\b)\b/.test(lower) ||
-        /\b(overflow|underflow|deadlock|hang)\b/.test(lower) ||
-        /\b(syzbot|regression)\b/.test(lower);
+    const subject = stripSubjectPrefixes(title);
+    const lead = firstParagraph(body);
+    const leadLower = lead.toLowerCase();
+    const bugfixInSubject = /\b(fix|fixes|fixup|revert)\b/i.test(subject);
+    // 正文里的 "fix" 出现得太泛（changelog、评审答复、后续补丁说明都会带），
+    // 用它判 bugfix 会把大量新特性/整理误标，所以正文只认高置信的缺陷信号。
+    const bugfixInText = /\b(fixes:|fixes\s+[0-9a-f]{7,})/.test(leadLower) ||
+        /\b(data\s+race|race\s+condition|kcsan)\b/.test(leadLower) ||
+        /\b(leak|memory\s+leak|refcount)\b/.test(leadLower) ||
+        /\b(crash|oops|panic|null\s*deref|null\s*pointer|use[-\s]after[-\s]free|\buaf\b)\b/.test(leadLower) ||
+        /\b(overflow|underflow|deadlock|hang)\b/.test(leadLower) ||
+        /\b(syzbot|regression)\b/.test(leadLower);
     const featureInSubject = 
-    // 兼容两种常见标题风格：
+    // 剥掉前缀后只需看动作词开头，兼容：
     // 1) "[PATCH] subsys: Add ..."（带 "subsys:" 前缀）
     // 2) "[PATCH 0/N] Add support for ..."（不带前缀，尤其 cover letter 常见）
-    /\[patch[^\]]*\]\s*[^:]+:\s*(add|adds|implement|introduce|support|enable)\b/i.test(title) ||
-        /^\s*\[patch[^\]]*\]\s*(add|adds|implement|introduce|support|enable)\b/i.test(title) ||
-        /^[^:]+:\s*(add|adds|implement|introduce|support|enable)\b/i.test(title.trim());
+    // 3) "wifi: iwlwifi: mvm: add ..."（多段前缀）
+    /^(add|adds|implement|introduce|support|enable)\b/i.test(subject) ||
+        /^\s*\[patch[^\]]*\]\s*(add|adds|implement|introduce|support|enable)\b/i.test(title);
     const featureInText = 
-    // 常见 feature 表述（更偏 commit message）
-    /\b(add(s|ed|ing)?|introduce(s|d)?|implement(s|ed|ing)?|enable(s|d)?|support(s|ed|ing)?)\b/.test(lower) ||
-        /\b(add(s|ing)?\s+support(\s+for)?|support\s+for)\b/.test(lower) ||
-        /\b(expose(s|d)?|export(s|ed|ing)?|provide(s|d)?|allow(s|ed|ing)?|permit(s|ted|ting)?)\b/.test(lower) ||
-        /\b(extend(s|ed|ing)?|expand(s|ed|ing)?|generaliz(e|es|ed|ing))\b/.test(lower) ||
-        /\b(plumb(s|ed|ing)?|wire(s|d)?\s+up|hook(s|ed|ing)?\s+up)\b/.test(lower) ||
-        /\b(new|initial)\s+(api|abi|interface|feature|support|infrastructure|framework|mechanism)\b/.test(lower);
+    // 常见 feature 表述（只扫正文首段）
+    /\b(add(s|ed|ing)?|introduce(s|d)?|implement(s|ed|ing)?|enable(s|d)?|support(s|ed|ing)?)\b/.test(leadLower) ||
+        /\b(add(s|ing)?\s+support(\s+for)?|support\s+for)\b/.test(leadLower) ||
+        /\b(expose(s|d)?|export(s|ed|ing)?|provide(s|d)?|allow(s|ed|ing)?|permit(s|ted|ting)?)\b/.test(leadLower) ||
+        /\b(extend(s|ed|ing)?|expand(s|ed|ing)?|generaliz(e|es|ed|ing))\b/.test(leadLower) ||
+        /\b(plumb(s|ed|ing)?|wire(s|d)?\s+up|hook(s|ed|ing)?\s+up)\b/.test(leadLower) ||
+        /\b(new|initial)\s+(api|abi|interface|feature|support|infrastructure|framework|mechanism)\b/.test(leadLower);
     // 按约定的优先级：
-    // 1) 标题先判 feature，再判 bugfix
-    // 2) 标题若为 other，则进入 commit message：先判 feature，再判 bugfix
+    // 1) 动作词在标题里最可信，先判 feature 再判 bugfix
+    //    （避免标题是 "Add support ..."、正文 changelog 里提到 "Fix ..." 被倒挂）
+    // 2) 标题判不出时才看正文首段：先判 bugfix 再判 feature
+    //    —— 正文里 "add" 的出现频率远高于 "fix"，先判 feature 会大量吞掉修复
     // 3) 都不命中才是 other
-    //
-    // 这样可以避免 cover letter/changelog 里出现 "Fix ..." 但标题是 "Add support ..." 时被误判为 bugfix。
     if (featureInSubject)
         return 'feature';
     if (bugfixInSubject)
         return 'bugfix';
-    if (featureInText)
-        return 'feature';
     if (bugfixInText)
         return 'bugfix';
+    if (featureInText)
+        return 'feature';
     return 'other';
 }

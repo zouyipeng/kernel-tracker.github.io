@@ -33,6 +33,22 @@ function sourceNameToFileName(name: string): string {
   return name.toLowerCase().replace(/\s+/g, '-')
 }
 
+// 子系统小节的徽章统计：条目数 + 需要一眼看到的 `perf` / `bugfix` 数量。
+// 「另有 N 项次要改动」是折叠行，不算条目。
+function summarizeBlock(markdown: string) {
+  let total = 0
+  let perf = 0
+  let bugfix = 0
+  for (const line of markdown.split('\n')) {
+    if (!line.trim().startsWith('- ')) continue
+    if (line.includes('另有 ') && line.includes('项次要改动')) continue
+    total++
+    if (line.includes('`perf`')) perf++
+    if (line.includes('`bugfix`')) bugfix++
+  }
+  return { total, perf, bugfix }
+}
+
 interface SourceDashboardProps {
   sourceName: string
   initialDate?: string
@@ -43,6 +59,25 @@ export default function SourceDashboard({ sourceName, initialDate }: SourceDashb
   const [loading, setLoading] = useState(true)
   const [availableDates, setAvailableDates] = useState<string[]>([])
   const [selectedDate, setSelectedDate] = useState<string>(initialDate || '')
+  // 子系统详情默认收起，只留一行徽章；点击标题或从总览跳转时展开。
+  const [expandedBlocks, setExpandedBlocks] = useState<Record<string, boolean>>({})
+
+  const toggleBlock = (title: string) =>
+    setExpandedBlocks(prev => ({ ...prev, [title]: !prev[title] }))
+
+  const jumpToAnchor = (id: string) => {
+    const scroll = () =>
+      document.getElementById(id)?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+
+    if (!id.startsWith('subsystem-')) {
+      scroll()
+      return
+    }
+    // 从总览点子系统名时先把目标卡片展开，再滚动，否则跳过去看到的还是收起的一行
+    const title = decodeURIComponent(id.slice('subsystem-'.length))
+    setExpandedBlocks(prev => ({ ...prev, [title]: true }))
+    requestAnimationFrame(scroll)
+  }
 
   const isGit = sourceData?.sourceType === 'git'
 
@@ -286,10 +321,7 @@ export default function SourceDashboard({ sourceName, initialDate }: SourceDashb
             aria-label={labelText || '跳转到补丁'}
             onClick={e => {
               e.preventDefault()
-              const el = document.getElementById(id) || document.getElementById(decodeURIComponent(id))
-              if (el) {
-                el.scrollIntoView({ behavior: 'smooth', block: 'start' })
-              }
+              jumpToAnchor(decodeURIComponent(id))
             }}
           >
             {children}
@@ -368,19 +400,59 @@ export default function SourceDashboard({ sourceName, initialDate }: SourceDashb
 
         {summaryBlocks.length > 0 && (
           <div className="mb-5 sm:mb-8 space-y-3">
-            {summaryBlocks.map((block, idx) => (
-              <div
-                key={`${block.title}-${idx}`}
-                id={block.title !== '总体' ? subsystemCardId(block.title) : undefined}
-                className="bg-white rounded-xl p-4 sm:p-5 border border-slate-200 shadow-sm"
-              >
-                <div className="prose prose-base max-w-none">
-                  <ReactMarkdown components={block.isOverview ? overviewSummaryComponents : categorySummaryComponents}>
-                    {block.markdown}
-                  </ReactMarkdown>
+            {summaryBlocks.map((block, idx) => {
+              if (block.isOverview) {
+                return (
+                  <div
+                    key={`${block.title}-${idx}`}
+                    className="bg-white rounded-xl p-4 sm:p-5 border border-slate-200 shadow-sm"
+                  >
+                    <div className="prose prose-base max-w-none">
+                      <ReactMarkdown components={overviewSummaryComponents}>{block.markdown}</ReactMarkdown>
+                    </div>
+                  </div>
+                )
+              }
+
+              const isOpen = !!expandedBlocks[block.title]
+              const stats = summarizeBlock(block.markdown)
+              // 标题由卡片头渲染，正文里去掉重复的 "## xxx"
+              const body = block.markdown.replace(/^##\s+.*\n?/, '')
+
+              return (
+                <div
+                  key={`${block.title}-${idx}`}
+                  id={subsystemCardId(block.title)}
+                  className="bg-white rounded-xl border border-slate-200 shadow-sm overflow-hidden scroll-mt-4"
+                >
+                  <button
+                    type="button"
+                    onClick={() => toggleBlock(block.title)}
+                    aria-expanded={isOpen}
+                    className="w-full flex flex-wrap items-center gap-x-2.5 gap-y-1 px-4 sm:px-5 py-3 text-left hover:bg-slate-50 transition-colors"
+                  >
+                    <span className="text-sm font-semibold text-sky-700">{block.title}</span>
+                    <span className="text-xs text-slate-400">{stats.total} 条</span>
+                    {stats.perf > 0 && (
+                      <span className="text-xs rounded-md bg-amber-50 text-amber-700 border border-amber-200 px-1.5 py-0.5">
+                        ⚡ {stats.perf}
+                      </span>
+                    )}
+                    {stats.bugfix > 0 && (
+                      <span className="text-xs rounded-md bg-rose-50 text-rose-700 border border-rose-200 px-1.5 py-0.5">
+                        🐛 {stats.bugfix}
+                      </span>
+                    )}
+                    <span className="ml-auto text-slate-400 text-xs">{isOpen ? '收起 ▲' : '展开 ▼'}</span>
+                  </button>
+                  {isOpen && (
+                    <div className="px-4 sm:px-5 pb-4 prose prose-base max-w-none">
+                      <ReactMarkdown components={categorySummaryComponents}>{body}</ReactMarkdown>
+                    </div>
+                  )}
                 </div>
-              </div>
-            ))}
+              )
+            })}
           </div>
         )}
         {summaryBlocks.length === 0 && summary && (

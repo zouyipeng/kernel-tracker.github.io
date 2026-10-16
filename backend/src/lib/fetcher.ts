@@ -219,6 +219,28 @@ function collectLkmlPatchMessagesFromHtml(
   }
 }
 
+// LKML 页面把补丁正文放在 <pre> 里，但行是用 <br /> 断的，cheerio 的 .text() 不会把它
+// 还原成换行。若不处理，整段补丁会被拼成一行：parseLkmlPatchText 找不到 "---" 分隔行，
+// commitMessage 会把整个 diff 一起吞掉（既把 diff 当描述喂给模型，也让类型判定扫到 diff 里的
+// 各种关键词）。这里先把 <br /> 换成真换行，再取文本。
+function extractPreTexts($: cheerio.CheerioAPI): string[] {
+  $('pre').find('br').replaceWith('\n')
+  return $('pre')
+    .toArray()
+    .map(el => $(el).text())
+    .map(t => (t || '').trim())
+    .filter(Boolean)
+}
+
+function scorePreText(t: string): number {
+  let s = 0
+  if (/\bdiff --git\b/i.test(t)) s += 50
+  if (/^---\s+a\//m.test(t) && /^\+\+\+\s+b\//m.test(t)) s += 30
+  if (/^Signed-off-by:/mi.test(t)) s += 10
+  if (t.length > 4000) s += 5
+  return s
+}
+
 function parseLkmlPatchText(rawText: string): { commitMessage: string; changedFiles: string[] } {
   const normalized = rawText.replace(/\r/g, '').trim()
   if (!normalized) return { commitMessage: '', changedFiles: [] }
@@ -280,22 +302,8 @@ async function fetchLkmlPatchDetails(
     try {
       const response = await axios.get(patchUrl, { headers, timeout: timeoutMs })
       const $ = cheerio.load(response.data)
-      const preTexts = $('pre')
-        .toArray()
-        .map(el => $(el).text())
-        .map(t => (t || '').trim())
-        .filter(Boolean)
-
-      const scorePre = (t: string) => {
-        let s = 0
-        if (/\bdiff --git\b/i.test(t)) s += 50
-        if (/^---\s+a\//m.test(t) && /^\+\+\+\s+b\//m.test(t)) s += 30
-        if (/^Signed-off-by:/mi.test(t)) s += 10
-        if (t.length > 4000) s += 5
-        return s
-      }
-
-      const rawPatchText = (preTexts.sort((a, b) => scorePre(b) - scorePre(a))[0] || '').trim()
+      const preTexts = extractPreTexts($)
+      const rawPatchText = (preTexts.sort((a, b) => scorePreText(b) - scorePreText(a))[0] || '').trim()
       const parsed = parseLkmlPatchText(rawPatchText)
       const dateRow = $('tr').filter((_, tr) => {
         const firstCell = $(tr).find('th, td').first().text().replace(/\s+/g, ' ').trim()
@@ -324,22 +332,8 @@ async function fetchLkmlPatchDetailsBrowser(
   try {
     const html = await fetchPageWithBrowser(browser, patchUrl, 'pre', 60000)
     const $ = cheerio.load(html)
-    const preTexts = $('pre')
-      .toArray()
-      .map(el => $(el).text())
-      .map(t => (t || '').trim())
-      .filter(Boolean)
-
-    const scorePre = (t: string) => {
-      let s = 0
-      if (/\bdiff --git\b/i.test(t)) s += 50
-      if (/^---\s+a\//m.test(t) && /^\+\+\+\s+b\//m.test(t)) s += 30
-      if (/^Signed-off-by:/mi.test(t)) s += 10
-      if (t.length > 4000) s += 5
-      return s
-    }
-
-    const rawPatchText = (preTexts.sort((a, b) => scorePre(b) - scorePre(a))[0] || '').trim()
+    const preTexts = extractPreTexts($)
+    const rawPatchText = (preTexts.sort((a, b) => scorePreText(b) - scorePreText(a))[0] || '').trim()
     const parsed = parseLkmlPatchText(rawPatchText)
     const dateRow = $('tr').filter((_, tr) => {
       const firstCell = $(tr).find('th, td').first().text().replace(/\s+/g, ' ').trim()
@@ -632,6 +626,7 @@ export async function fetchAll(): Promise<void> {
         subsystemPrompt: config.subsystemPrompt,
         overallPrompt: config.overallPrompt,
         summaryMaxChars: config.summaryMaxChars,
+        subsystemMaxItems: config.subsystemMaxItems,
         subsystemSummaryConcurrency: config.subsystemSummaryConcurrency,
         fixedSubsystemRules: config.fixedSubsystemRules,
       })

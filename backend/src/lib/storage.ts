@@ -34,6 +34,9 @@ export interface SourcesConfig {
   // 总览（今日社区动态 正文）字数上限，默认 900 字
   // 按整行渲染后的可见字数计（含图标/子系统名/「：」），不含各子系统详情小节
   summaryMaxChars?: number
+  // 单个子系统详情区逐条展开的条目上限，默认 10。
+  // 超出的部分折叠成一行「另有 N 项次要改动」+ 链接，避免详情区变成一堵墙。
+  subsystemMaxItems?: number
   // 全局并发上限（避免一次性几十个子系统触发限流）
   subsystemSummaryConcurrency?: number
   sources: Source[]
