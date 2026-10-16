@@ -46,7 +46,10 @@ const MAX_RETRIES = 3;
 const RETRY_DELAY = 1000;
 // 总览（「今日社区动态」正文）字数上限的默认值，可在 sources-config.json 用
 // summaryMaxChars 覆盖。
-const DEFAULT_SUMMARY_MAX_CHARS = 500;
+// 注意：这里统计的是整行渲染后的可见字数，含图标、子系统名与「：」，13 个子系统的
+// 固定开销约 178 字；若上限设得过低（如 500），留给点评正文的额度不足，兜底截断会
+// 把每行从中间切断。
+const DEFAULT_SUMMARY_MAX_CHARS = 900;
 // 统计“渲染后可见字数”：Markdown 链接/图片还原成其显示文本，去掉标记符号与空白，
 // 再按 Unicode 码点计数（emoji 记 1 个字）。
 function countVisibleChars(markdown) {
@@ -238,6 +241,46 @@ function extractLinks(line) {
         out.push(m[1]);
     return out;
 }
+// 条目类型/perf 在抓取阶段已由规则算好（并随输入行的 type=/tag= 字段一并传给模型），
+// 但模型偶尔会漏写这些标签。normalizeLineTags 对无标签的行兜底判定为 `other`，
+// 一旦整段标签缺失，reorderAndCollapseSubsystemLines 就会误判为「全是次要改动」并
+// 折叠成一行链接，把描述文本全部丢掉（曾导致 Networking 87 条 patch 退化成 1 行）。
+// 这里按行内链接回查来源文章，直接用规则结果覆盖模型标签；匹配不到的行才保留模型判断。
+function applySourceTags(block, articles) {
+    const byUrl = new Map();
+    for (const a of articles) {
+        const url = a.patchData?.url || a.gitCommitData?.url || a.url;
+        if (!url)
+            continue;
+        const title = a.patchData?.title || a.gitCommitData?.title || a.title;
+        const content = a.patchData?.content || a.gitCommitData?.content || a.content || '';
+        byUrl.set(url, { type: getArticleType(a), perf: detectPerfRelated(`${title}\n${content}`) });
+    }
+    return (block || '')
+        .split('\n')
+        .map(line => {
+        const m = line.match(/^(\s*[-*]\s+)(.*)$/);
+        if (!m)
+            return line;
+        const source = extractLinks(m[2])
+            .map(u => byUrl.get(u))
+            .find(Boolean);
+        if (!source)
+            return line;
+        const text = m[2]
+            .replace(/^(`?(feature|bugfix|other|perf)`?[\s/:|]+)+/i, '')
+            .replace(/`(feature|bugfix|other)`\s*/g, '')
+            .replace(/`perf`\s*/g, '')
+            .trim();
+        const label = `${source.perf ? '`perf` ' : ''}\`${source.type}\``;
+        return `${m[1]}${label} ${text}`;
+    })
+        .join('\n')
+        .trim();
+}
+// 全段均为 `other` 且条目足够多时，说明该子系统当天确实只有次要改动，
+// 折叠成一行概览避免刷屏；条目不多时保留原描述，不做折叠。
+const COLLAPSE_OTHER_MIN_ITEMS = 6;
 function reorderAndCollapseSubsystemLines(block) {
     const lines = (block || '')
         .split('\n')
@@ -267,11 +310,14 @@ function reorderAndCollapseSubsystemLines(block) {
     });
     const otherItems = items.filter(i => i.type === 'other');
     const nonOther = items.filter(i => i.type !== 'other');
+    // 仅当该子系统当天全是次要改动、且条目足够多时才折叠；其余情况逐条保留描述，
+    // 避免混在 feature/bugfix 之间的少量 other 条目被替换成一行链接。
+    const collapseOther = nonOther.length === 0 && otherItems.length >= COLLAPSE_OTHER_MIN_ITEMS;
     const outLines = [];
     for (const it of nonOther) {
         outLines.push(`- ${it.raw}`);
     }
-    if (otherItems.length > 0) {
+    if (collapseOther) {
         const links = otherItems.flatMap(i => i.links).filter(Boolean);
         const uniqLinks = [];
         for (const u of links) {
@@ -279,7 +325,12 @@ function reorderAndCollapseSubsystemLines(block) {
                 uniqLinks.push(u);
         }
         const linkText = uniqLinks.map(u => `[↗](${u})`).join(' ');
-        outLines.push(`- \`other\` 其他改动多为小修正、清理或配置更新，整体风险较低，详情见：${linkText}`.trim());
+        outLines.push(`- \`other\` 该子系统当日 ${otherItems.length} 项改动多为小修正、清理或配置更新，整体风险较低，详情见：${linkText}`.trim());
+    }
+    else {
+        for (const it of otherItems) {
+            outLines.push(`- ${it.raw}`);
+        }
     }
     return outLines.join('\n').trim();
 }
@@ -470,7 +521,8 @@ async function summarizeSubsystem(subsystem, subsystemArticles, prompt) {
     }, `生成子系统摘要 - ${subsystem}`);
     const rawContent = result.choices[0]?.message?.content || '';
     const normalized = normalizeOneItemPerLine(normalizeSummaryTagLines(cleanAIResponse(rawContent))).trim();
-    return reorderAndCollapseSubsystemLines(normalized).trim();
+    const tagged = applySourceTags(normalized, subsystemArticles);
+    return reorderAndCollapseSubsystemLines(tagged).trim();
 }
 // Make subsystem names clickable to jump to corresponding detail blocks.
 // Frontend cards use: id="subsystem-${encodeURIComponent(title)}"
@@ -508,6 +560,36 @@ function wrapSubsystemLinks(cleaned, subsystems) {
     }
     return out;
 }
+// 拆分总览行：`- 🧠 [Memory](#subsystem-Memory)：正文` -> { label: '🧠 Memory', body: '正文' }
+function splitOverviewLine(line) {
+    const t = (line || '').trim().replace(/^[-*]\s+/, '');
+    const plain = t.replace(/!?\[([^\]]*)\]\([^)]*\)/g, '$1').replace(/[`*_~]/g, '');
+    const idx = plain.search(/[：:]/);
+    if (idx < 0)
+        return { label: '', body: plain.trim() };
+    return { label: plain.slice(0, idx).trim(), body: plain.slice(idx + 1).trim() };
+}
+// 模型对当天只有清理/注释/配置/小修正的子系统，常写「以清理、配置更新和小修复为主，
+// 无突出性能或特性变更，风险低」这类套话。这类行没体现任何具体动态，总览里直接不展示。
+// 为保守起见，仅当正文命中套话、且不含英文标识符（如 io_uring、blk-mq、XFS）时才判空。
+const EMPTY_DYNAMIC_PATTERNS = [
+    /无\s*(突出|重大|显著|明显|实质|值得一提)/,
+    /未见\s*(显著|明显|重大|突出|实质)/,
+    /未(发现|出现)\s*(显著|明显|重大|突出)/,
+    /(以|多为|主要(是|为))\s*[^，。；]{0,12}(清理|注释|配置|小修正|小修复|维护)/,
+    /无\s*(新特性|性能优化|功能变化|接口变化)/,
+    /风险\s*(较)?低/,
+    /代码卫生/,
+];
+const IDENTIFIER_RE = /[A-Za-z][A-Za-z0-9_.&-]+/;
+function isEmptyDynamicLine(line) {
+    const { body } = splitOverviewLine(line);
+    if (!body)
+        return true;
+    if (IDENTIFIER_RE.test(body))
+        return false;
+    return EMPTY_DYNAMIC_PATTERNS.some(re => re.test(body));
+}
 // 兜底：模型多轮后仍未收敛时，硬性压到上限内。
 // 优先按篇幅比例压缩每一行，尽量让所有子系统都保留；实在压不下去才从末尾整条删减。
 function enforceOverviewBudget(lines, maxChars) {
@@ -539,6 +621,8 @@ async function summarizeOverall(subsystemSummaries, prompt, maxChars = DEFAULT_S
     const budgetRule = `\n\n【字数硬约束】总览正文（不含大标题）总字数必须 ≤ ${maxChars} 字，越精简越好：\n` +
         '- 每个子系统只占一行，用一句话（约 20~40 字）说明「做了什么 + 收益/影响」\n' +
         '- 只保留最重要的动态，次要修复、清理、统计数字、枚举罗列一律省略\n' +
+        '- 若某子系统本日只有清理、注释、配置更新或小修正等无实质动态，**整行省略**，\n' +
+        '  不要用「以清理…为主，无突出性能或特性变更，风险低」这类套话占位\n' +
         '- 宁可少写，不可超字数';
     const systemPrompt = `${(prompt || defaultPrompt).trim()}${budgetRule}`;
     const merged = subsystemSummaries
@@ -547,6 +631,7 @@ async function summarizeOverall(subsystemSummaries, prompt, maxChars = DEFAULT_S
         .join('\n\n');
     const subsystems = subsystemSummaries.map(s => s.subsystem).filter(Boolean);
     let lines = [];
+    let droppedLabels = [];
     const MAX_ATTEMPTS = 2;
     for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
         const retryRule = attempt === 1
@@ -567,11 +652,25 @@ async function summarizeOverall(subsystemSummaries, prompt, maxChars = DEFAULT_S
         }, '生成整体点评');
         const rawContent = result.choices[0]?.message?.content || '';
         const cleaned = cleanAIResponse(rawContent).trim();
-        lines = wrapSubsystemLinks(cleaned, subsystems);
+        // 丢掉「无实质动态」的占位行：这类子系统在总览里不体现（详情小节不受影响）。
+        const kept = [];
+        droppedLabels = [];
+        for (const line of wrapSubsystemLinks(cleaned, subsystems)) {
+            if (isEmptyDynamicLine(line)) {
+                droppedLabels.push(splitOverviewLine(line).label || line.trim());
+            }
+            else {
+                kept.push(line);
+            }
+        }
+        lines = kept;
         if (countVisibleChars(lines.join('\n')) <= maxChars)
             break;
     }
     const budgeted = enforceOverviewBudget(lines, maxChars);
+    if (droppedLabels.length > 0) {
+        console.log(`[AI] 总览省略无实质动态的子系统: ${droppedLabels.join('、')}`);
+    }
     console.log(`[AI] 总览字数: ${countVisibleChars(budgeted.join('\n'))}/${maxChars}`);
     return budgeted.join('\n').trim();
 }

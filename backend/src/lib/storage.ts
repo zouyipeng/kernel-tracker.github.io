@@ -31,7 +31,8 @@ export interface SourcesConfig {
   subsystemPrompt?: string
   // 全局 prompt（聚合各子系统后整体点评，独立上下文）
   overallPrompt?: string
-  // 总览（今日社区动态 正文）字数上限，默认 500 字
+  // 总览（今日社区动态 正文）字数上限，默认 900 字
+  // 按整行渲染后的可见字数计（含图标/子系统名/「：」），不含各子系统详情小节
   summaryMaxChars?: number
   // 全局并发上限（避免一次性几十个子系统触发限流）
   subsystemSummaryConcurrency?: number
