@@ -44,6 +44,37 @@ const openai = new openai_1.default({
 });
 const MAX_RETRIES = 3;
 const RETRY_DELAY = 1000;
+// 总览（「今日社区动态」正文）字数上限的默认值，可在 sources-config.json 用
+// summaryMaxChars 覆盖。
+const DEFAULT_SUMMARY_MAX_CHARS = 500;
+// 统计“渲染后可见字数”：Markdown 链接/图片还原成其显示文本，去掉标记符号与空白，
+// 再按 Unicode 码点计数（emoji 记 1 个字）。
+function countVisibleChars(markdown) {
+    const visible = (markdown || '')
+        .replace(/!\[[^\]]*\]\([^)]*\)/g, '')
+        .replace(/\[([^\]]*)\]\([^)]*\)/g, '$1')
+        .replace(/[`*_~>#]/g, '')
+        .replace(/\s+/g, '');
+    return Array.from(visible).length;
+}
+// 把一行拆成 token：Markdown 链接整体作为一个 token，其余按码点切分。
+// 按 token 截断可以避免把 [名称](#锚点) 剪断导致链接语法失效。
+function markdownTokens(text) {
+    return text.match(/!?\[[^\]]*\]\([^)]*\)|./gsu) || [];
+}
+// 按可见字数上限截断一行，超出部分用 …
+function truncateVisible(text, limit) {
+    let kept = '';
+    let count = 0;
+    for (const token of markdownTokens(text)) {
+        const t = countVisibleChars(token);
+        if (count + t > limit - 1)
+            break;
+        kept += token;
+        count += t;
+    }
+    return `${kept.replace(/[\s，。；：、,;:.]+$/, '')}…`;
+}
 function cleanAIResponse(content) {
     if (!content)
         return '';
@@ -441,30 +472,9 @@ async function summarizeSubsystem(subsystem, subsystemArticles, prompt) {
     const normalized = normalizeOneItemPerLine(normalizeSummaryTagLines(cleanAIResponse(rawContent))).trim();
     return reorderAndCollapseSubsystemLines(normalized).trim();
 }
-async function summarizeOverall(subsystemSummaries, prompt) {
-    const defaultPrompt = '你是 Linux 内核开发专家。你将收到多个子系统的条目式总结。\n\n输出要求：\n- 用中文\n- 不要输出思考过程\n- 不要输出任何 Markdown 标题\n- 输出 1~3 段整体点评：概括主要方向、风险点/回归风险、性能相关动向与后续关注点\n- 不要逐条重复子系统条目\n';
-    const systemPrompt = (prompt || defaultPrompt).trim();
-    const merged = subsystemSummaries
-        .filter(s => s.summary.trim())
-        .map(s => `## ${s.subsystem}\n${s.summary.trim()}`)
-        .join('\n\n');
-    const messages = [
-        { role: 'system', content: systemPrompt },
-        { role: 'user', content: merged || '（无子系统条目）' },
-    ];
-    const result = await withRetry(async () => {
-        return await openai.chat.completions.create({
-            model: config.openai.model,
-            messages,
-            max_tokens: config.openai.maxTokens,
-            temperature: 0.6,
-        });
-    }, '生成整体点评');
-    const rawContent = result.choices[0]?.message?.content || '';
-    const cleaned = cleanAIResponse(rawContent).trim();
-    // Make subsystem names clickable to jump to corresponding detail blocks.
-    // Frontend cards use: id="subsystem-${encodeURIComponent(title)}"
-    const subsystems = subsystemSummaries.map(s => s.subsystem).filter(Boolean);
+// Make subsystem names clickable to jump to corresponding detail blocks.
+// Frontend cards use: id="subsystem-${encodeURIComponent(title)}"
+function wrapSubsystemLinks(cleaned, subsystems) {
     const toId = (name) => `#subsystem-${encodeURIComponent(name)}`;
     const lines = cleaned.split('\n').map(l => l.trimEnd());
     const out = [];
@@ -486,21 +496,84 @@ async function summarizeOverall(subsystemSummaries, prompt) {
             continue;
         }
         // Replace the first matching "<icon> <subsystem>：" or "<subsystem>："
-        let replaced = false;
         for (const s of subsystems) {
             const esc = s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
             const re = new RegExp(`(^|\\s)(${esc})(\\s*：)`);
             if (re.test(rest)) {
                 rest = rest.replace(re, (_all, p1, p2, p3) => `${p1}[${p2}](${toId(s)})${p3}`);
-                replaced = true;
                 break;
             }
         }
         out.push(`${prefix}${rest}`);
-        if (!replaced)
-            continue;
     }
-    return out.join('\n').trim();
+    return out;
+}
+// 兜底：模型多轮后仍未收敛时，硬性压到上限内。
+// 优先按篇幅比例压缩每一行，尽量让所有子系统都保留；实在压不下去才从末尾整条删减。
+function enforceOverviewBudget(lines, maxChars) {
+    const items = lines.filter(l => l.trim());
+    if (items.length === 0)
+        return [];
+    if (countVisibleChars(items.join('\n')) <= maxChars)
+        return items;
+    let factor = maxChars / countVisibleChars(items.join('\n'));
+    for (let round = 0; round < 8; round++) {
+        const shrunk = items.map(item => {
+            const len = countVisibleChars(item);
+            const quota = Math.max(12, Math.floor(len * factor));
+            return len <= quota ? item : truncateVisible(item, quota);
+        });
+        const total = countVisibleChars(shrunk.join('\n'));
+        if (total <= maxChars)
+            return shrunk;
+        factor *= maxChars / total;
+    }
+    const out = items.slice();
+    while (out.length > 1 && countVisibleChars(out.join('\n')) > maxChars)
+        out.pop();
+    return out;
+}
+async function summarizeOverall(subsystemSummaries, prompt, maxChars = DEFAULT_SUMMARY_MAX_CHARS) {
+    const defaultPrompt = '你是 Linux 内核开发专家。你将收到多个子系统的条目式总结。\n\n输出要求：\n- 用中文\n- 不要输出思考过程\n- 不要输出任何 Markdown 标题\n- 输出 Markdown 无序列表，每个子系统 1 行，格式：<图标> <子系统>：<一句话点评>\n- 只保留最重要的动态，不要逐条重复子系统条目\n';
+    // 字数硬约束：直接追加到 prompt 后面，保证自定义 prompt 也生效。
+    const budgetRule = `\n\n【字数硬约束】总览正文（不含大标题）总字数必须 ≤ ${maxChars} 字，越精简越好：\n` +
+        '- 每个子系统只占一行，用一句话（约 20~40 字）说明「做了什么 + 收益/影响」\n' +
+        '- 只保留最重要的动态，次要修复、清理、统计数字、枚举罗列一律省略\n' +
+        '- 宁可少写，不可超字数';
+    const systemPrompt = `${(prompt || defaultPrompt).trim()}${budgetRule}`;
+    const merged = subsystemSummaries
+        .filter(s => s.summary.trim())
+        .map(s => `## ${s.subsystem}\n${s.summary.trim()}`)
+        .join('\n\n');
+    const subsystems = subsystemSummaries.map(s => s.subsystem).filter(Boolean);
+    let lines = [];
+    const MAX_ATTEMPTS = 2;
+    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+        const retryRule = attempt === 1
+            ? ''
+            : `\n\n【重试】上一次输出为 ${countVisibleChars(lines.join('\n'))} 字，超出 ${maxChars} 字上限。` +
+                '请大幅压缩：合并同类项，每个子系统只留最关键的一点，删掉所有细节与次要项。';
+        const messages = [
+            { role: 'system', content: `${systemPrompt}${retryRule}` },
+            { role: 'user', content: merged || '（无子系统条目）' },
+        ];
+        const result = await withRetry(async () => {
+            return await openai.chat.completions.create({
+                model: config.openai.model,
+                messages,
+                max_tokens: config.openai.maxTokens,
+                temperature: 0.6,
+            });
+        }, '生成整体点评');
+        const rawContent = result.choices[0]?.message?.content || '';
+        const cleaned = cleanAIResponse(rawContent).trim();
+        lines = wrapSubsystemLinks(cleaned, subsystems);
+        if (countVisibleChars(lines.join('\n')) <= maxChars)
+            break;
+    }
+    const budgeted = enforceOverviewBudget(lines, maxChars);
+    console.log(`[AI] 总览字数: ${countVisibleChars(budgeted.join('\n'))}/${maxChars}`);
+    return budgeted.join('\n').trim();
 }
 function summarizeUnmatchedScopeLocally(unmatched) {
     const total = unmatched.length;
@@ -599,7 +672,7 @@ async function generateSummary(articles, promptOrOptions) {
         const summary = await summarizeSubsystem(entry.subsystem, entry.list, options.subsystemPrompt || options.summaryPrompt);
         return { subsystem: entry.subsystem, summary };
     });
-    const overall = await summarizeOverall(subsystemSummaries, options.overallPrompt);
+    const overall = await summarizeOverall(subsystemSummaries, options.overallPrompt, options.summaryMaxChars ?? DEFAULT_SUMMARY_MAX_CHARS);
     const parts = [];
     parts.push(`# 今日社区动态（${model} | ${dateRange || '未知'}）`);
     parts.push('');

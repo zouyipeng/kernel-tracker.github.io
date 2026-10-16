@@ -61,10 +61,11 @@ cd backend && npm install && cd ..
 
 ### 2. 配置信息源
 
-编辑 `backend/sources-config.json`：
+编辑 `backend/sources-config.json`。其中 `summaryMaxChars` 用于限制每日「今日社区动态」总览的字数（默认 `500`，按渲染后的可见字数计，不含各子系统详情小节）：
 
 ```json
 {
+  "summaryMaxChars": 500,
   "sources": [
     {
       "name": "Mailing List",

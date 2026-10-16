@@ -263,9 +263,10 @@
       "include/linux/acpi"
     ]
   },
+  "summaryMaxChars": 500,
   "subsystemSummaryConcurrency": 6,
   "subsystemPrompt": "你是 Linux 内核开发专家。现在只分析单个子系统下的补丁/提交动态。\n\n输出要求：\n- 用中文\n- 不要输出思考过程\n- 不要写一级标题/二级标题（标题由上层拼接）\n- 输出必须是“每条独立一行”的条目\n- 每条必须包含：`feature`/`bugfix`/`other` 标签；若为性能优化/性能相关需同时包含 `perf`（例如：`perf` `feature`）\n- 行末必须包含补丁/提交的原始链接，格式如 [↗](https://...)（不要用 # 锚点）\n- 子系统内输出顺序：先 `perf`，再 `feature`，再 `bugfix`，最后 `other`\n- 不要原样复述标题，先描述做了什么然后说明为什么重要最后点评该修改。\n\n你将收到该子系统条目列表（每条含标题、类型、perf 标记、链接、作者、时间、变更文件等）不要修改每个条目的类型以及perf标记。请基于这些信息生成条目式总结。",
-  "overallPrompt": "你是 Linux 内核开发专家。你将收到多个子系统的条目式总结（每个子系统若干行）。\n\n输出要求：\n- 用中文\n- 不要输出思考过程\n- 输出为 Markdown 无序列表，每个子系统 1 个列表项\n- **子系统名与正文必须在同一行**，格式固定为：\n  - <图标> <subsystem>：<点评正文>\n- 每条点评正文允许 1~3 句，但必须保持在同一行（不要换行）\n- 点评内容必须尽量覆盖：性能优化的“优化点→收益/效果”，以及新特性解决的问题/带来的能力（若该子系统无 perf/feature，则总结性的给出主要的修复/维护内容）\n- 每条前放一个“简洁、风格一致”的小图标，优先使用以下映射（subsystem 名称必须与上面一致）：\n  - Memory：🧠\n  - Scheduling：🧭\n  - Networking：🌐\n  - Security：🛡\n  - Observability：📈\n  - Filesystem & Storage：🗂\n  - Architecture：🏗\n  - Virtualization：🧩\n  - Power Management：🔋\n  - Interrupts：⚡\n  - Clocks & Timers：⏱\n  - Core Kernel：⚙\n  - Drivers：🧰\n- 重点关注子系统里的性能优化与新特性\n- 不要逐条复述子系统条目；要做归纳\n- 不要输出额外的大标题（例如“总体评价”）",
+  "overallPrompt": "你是 Linux 内核开发专家。你将收到多个子系统的条目式总结（每个子系统若干行）。\n\n输出要求：\n- 用中文\n- 不要输出思考过程\n- 输出为 Markdown 无序列表，每个子系统 1 个列表项\n- **子系统名与正文必须在同一行**，格式固定为：\n  - <图标> <subsystem>：<点评正文>\n- 每条点评正文限 1 句（约 20~40 字），越精简越好，必须保持在同一行（不要换行）\n- 每条只讲一个最重要的动态：性能优化写“优化点→收益”，新特性写“解决了什么/带来什么能力”；若无 perf/feature，用半句概括维护/修复内容\n- 每条前放一个“简洁、风格一致”的小图标，优先使用以下映射（subsystem 名称必须与上面一致）：\n  - Memory：🧠\n  - Scheduling：🧭\n  - Networking：🌐\n  - Security：🛡\n  - Observability：📈\n  - Filesystem & Storage：🗂\n  - Architecture：🏗\n  - Virtualization：🧩\n  - Power Management：🔋\n  - Interrupts：⚡\n  - Clocks & Timers：⏱\n  - Core Kernel：⚙\n  - Drivers：🧰\n- 重点关注子系统里的性能优化与新特性\n- 不要逐条复述子系统条目；要做归纳\n- 不要输出额外的大标题（例如“总体评价”）",
   "sources": [
     {
       "name": "Mailing List",

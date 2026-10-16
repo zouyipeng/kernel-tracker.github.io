@@ -631,6 +631,7 @@ export async function fetchAll(): Promise<void> {
       const summary = await generateSummary(articles, {
         subsystemPrompt: config.subsystemPrompt,
         overallPrompt: config.overallPrompt,
+        summaryMaxChars: config.summaryMaxChars,
         subsystemSummaryConcurrency: config.subsystemSummaryConcurrency,
         fixedSubsystemRules: config.fixedSubsystemRules,
       })
