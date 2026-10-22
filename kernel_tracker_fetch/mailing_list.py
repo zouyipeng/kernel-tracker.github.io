@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import datetime
 import json
+import re
 import socket
 import ssl
 import sys
@@ -95,6 +96,28 @@ def _join_url(path: str) -> str:
     return f"{BASE_SITE}{BASE_PATH}{path}"
 
 
+def _strip_subsystem_labels(summary: str) -> str:
+    """去掉指向网页锚点的子系统跳转标签，只保留正文。
+
+    兼容三种写法：
+    - 新版行尾标签：``……延迟（[Scheduling](#subsystem-Scheduling)）``
+    - 旧版行首标签：``- 🧠 [Memory](#subsystem-Memory)：……``
+    - 其他零散锚点：``[Scheduling](#subsystem-Scheduling)`` → ``Scheduling``
+    """
+    # 行尾带括号包裹的标签整体删除（含括号与前面的空白）
+    summary = re.sub(
+        r"[ \t]*[（(]\s*\[[^\]]*\]\(#subsystem-[^)]*\)\s*[）)]", "", summary
+    )
+    # 旧版行首标签连同紧随的冒号一起删除，用单个空格衔接前后文字
+    summary = re.sub(
+        r"[ \t]*\[[^\]]*\]\(#subsystem-[^)]*\)[：:]?[ \t]*", " ", summary
+    )
+    # 兜底：任何残留的 subsystem 锚点只保留文本
+    summary = re.sub(r"\[([^\]]*)\]\(#subsystem-[^)]*\)", r"\1", summary)
+    # 清理删除后可能留下的行尾空格
+    return re.sub(r"[ \t]+$", "", summary, flags=re.MULTILINE)
+
+
 def fetch_latest_mailing_list_summary() -> str:
     """
     Download the latest mailing-list day from source-dates.json, trim to 今日社区动态
@@ -128,10 +151,8 @@ def fetch_latest_mailing_list_summary() -> str:
     if cut != -1:
         summary = summary[:cut].rstrip()
 
-    # 只移除括号内包含 #subsystem- 的锚点部分，保留行的其余内容
-    import re
-    # 匹配 [text](#subsystem-text) 格式的锚点，替换为 text
-    summary = re.sub(r'\[(.*?)\]\(#subsystem-[^)]*\)', r'\1', summary)
+    # 移除（[Scheduling](#subsystem-Scheduling)）这类网页跳转标签，保留正文
+    summary = _strip_subsystem_labels(summary)
 
     detail_url = _join_url(f"/{date_str}/mailing-list")
     return f"{summary}\n详情请查看：{detail_url}"
