@@ -9,6 +9,7 @@ import socket
 import ssl
 import sys
 import time
+import unicodedata
 from typing import Any, Dict
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
@@ -96,6 +97,39 @@ def _join_url(path: str) -> str:
     return f"{BASE_SITE}{BASE_PATH}{path}"
 
 
+# 默认按「文本呈现」渲染的 emoji：只占 1 列宽，字形会紧紧贴住后面的正文，
+# 在聊天窗口里看起来就像图标和文字之间漏了空格（🔥✨⚡ 这类默认 2 列，不会）。
+# 补上 U+FE0F 强制按 emoji 呈现，宽度才和其他图标一致。
+_TEXT_PRESENTATION_EMOJI = frozenset("🛡⚙🗂🏗⏱")
+
+# 行首的 「- <图标>」；图标只取第一个码点，可选带一个 U+FE0F
+_BULLET_ICON_RE = re.compile(r"^-[ \t]*(\S)(️)?[ \t]*", re.MULTILINE)
+
+
+def _normalize_bullet_icons(summary: str) -> str:
+    """统一列表项开头的「- 图标 正文」格式。
+
+    - 图标与正文之间固定保留一个空格（防止模型偶尔输出 ``🛡af_alg`` 这种粘连）；
+    - 文本呈现型 emoji 升级为 emoji 呈现，避免窄字形让空格看起来消失。
+    详情小节里以 `` `perf` `` 等普通文本开头的条目保持原样。
+    """
+
+    def _fix(match: re.Match) -> str:
+        icon, vs16 = match.group(1), match.group(2) or ""
+        # 只处理 emoji 开头的条目；`perf`、中文等普通条目原样返回
+        if unicodedata.category(icon) != "So":
+            return match.group(0)
+        rest = match.string[match.end() : match.end() + 1]
+        # ZWJ 组合或肤色修饰符等复合 emoji，不能从中间拆开
+        if rest == "‍" or 0x1F3FB <= ord(rest or "\0") <= 0x1F3FF:
+            return match.group(0)
+        if not vs16 and icon in _TEXT_PRESENTATION_EMOJI:
+            vs16 = "️"
+        return f"- {icon}{vs16} "
+
+    return _BULLET_ICON_RE.sub(_fix, summary)
+
+
 def _strip_subsystem_labels(summary: str) -> str:
     """去掉指向网页锚点的子系统跳转标签，只保留正文。
 
@@ -153,6 +187,8 @@ def fetch_latest_mailing_list_summary() -> str:
 
     # 移除（[Scheduling](#subsystem-Scheduling)）这类网页跳转标签，保留正文
     summary = _strip_subsystem_labels(summary)
+    # 统一「- 图标 正文」的间距与图标呈现方式
+    summary = _normalize_bullet_icons(summary)
 
     detail_url = _join_url(f"/{date_str}/mailing-list")
     return f"{summary}\n详情请查看：{detail_url}"
