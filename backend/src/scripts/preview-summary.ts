@@ -6,7 +6,7 @@ import { execFileSync } from 'child_process'
 import * as cheerio from 'cheerio'
 import fs from 'fs'
 import path from 'path'
-import { generateSummary, inferPatchTypeRuleBased } from '../lib/ai'
+import { analyzeArticlePriority, generateSummary, inferPatchTypeRuleBased } from '../lib/ai'
 import { inferFixedSubsystemFromFiles } from '../lib/fixedSubsystem'
 import { loadSourcesConfig, type Article, type LKMLPatch } from '../lib/storage'
 
@@ -208,6 +208,17 @@ async function main() {
     '[preview] 子系统分布:',
     Array.from(bySub.entries()).sort((a, b) => b[1] - a[1]).map(([k, v]) => `${k}=${v}`).join(', ')
   )
+
+  const ranked = articles
+    .map(a => ({ title: a.patchData?.title || a.title, ...analyzeArticlePriority(a) }))
+    .sort((a, b) => b.score - a.score)
+  console.log('[preview] 优先级 Top 10:')
+  for (const r of ranked.slice(0, 10)) {
+    const tags = [r.category, r.arch, r.driverScope !== 'none' ? r.driverScope : '']
+      .filter(Boolean)
+      .join('/')
+    console.log(`  ${String(r.score).padStart(4)} [${tags}] ${r.title}`)
+  }
 
   const out = await generateSummary(articles, {
     subsystemPrompt: cfg.subsystemPrompt,

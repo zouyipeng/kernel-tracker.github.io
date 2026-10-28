@@ -338,9 +338,14 @@ function renderLinks(links: string[]): string {
   return `${shown.map(u => `[↗](${u})`).join(' ')}${suffix}`
 }
 
+// 单个子系统里最多展开几条「具体设备驱动」条目；超出的折进「另有 N 项」，
+// 避免具体驱动把驱动框架/核心改动挤出详情区。
+const MAX_SPECIFIC_DRIVER_ITEMS = 2
+
 function reorderAndCollapseSubsystemLines(
   block: string,
-  maxItems: number = DEFAULT_SUBSYSTEM_MAX_ITEMS
+  maxItems: number = DEFAULT_SUBSYSTEM_MAX_ITEMS,
+  priorityByUrl?: Map<string, ArticlePriorityByUrlEntry>
 ): string {
   const lines = (block || '')
     .split('\n')
@@ -350,27 +355,25 @@ function reorderAndCollapseSubsystemLines(
   const items = lines.map((l, idx) => {
     const text = l.replace(/^[-*]\s+/, '').trim()
     const tags = extractTags(text)
-    return { raw: text, ...tags, links: extractLinks(text), idx }
+    const links = extractLinks(text)
+    const linkInfos = links
+      .map(u => priorityByUrl?.get(u))
+      .filter((x): x is ArticlePriorityByUrlEntry => Boolean(x))
+    // 找不到来源文章时（链接不匹配），退回按标签估算，保证排序仍然稳定
+    const fallbackScore = tags.hasPerf ? 40 : tags.type === 'feature' ? 30 : tags.type === 'other' ? 10 : 0
+    const score =
+      linkInfos.length > 0 ? Math.max(...linkInfos.map(i => i.score)) : fallbackScore
+    // 同一行有多个链接时，只要有一个不是具体驱动，就按非具体驱动处理
+    const driverScope: DriverScope =
+      linkInfos.length > 0 && linkInfos.every(i => i.driverScope === 'specific')
+        ? 'specific'
+        : 'none'
+    return { raw: text, ...tags, links, idx, score, driverScope }
   })
 
-  // 排序即优先级：perf > bugfix > feature > other。
-  // 这里按「风险/收益」排而不是按类型字母序，是因为超出上限的尾部会被折叠掉——
-  // 若把 feature 排在 bugfix 前面，折叠时丢掉的会是一整批回归修复。
-  const orderType: Record<'feature' | 'bugfix' | 'other', number> = { bugfix: 1, feature: 2, other: 3 }
-  items.sort((a, b) => {
-    // 1) perf 优先
-    // 2) 组内按 bugfix -> feature -> other
-    // 3) 同组同类型保持原始顺序（稳定）
-    const pa = a.hasPerf ? 0 : 1
-    const pb = b.hasPerf ? 0 : 1
-    if (pa !== pb) return pa - pb
-
-    const ta = orderType[a.type]
-    const tb = orderType[b.type]
-    if (ta !== tb) return ta - tb
-
-    return a.idx - b.idx
-  })
+  // 排序即优先级：分数来自来源文章（arm64/x86、性能/功能重构、驱动框架加权；
+  // 其他架构、bugfix、具体设备驱动降权）。超出上限的尾部会被折叠，因此必须先按分数排。
+  items.sort((a, b) => b.score - a.score || a.idx - b.idx)
 
   const otherItems = items.filter(i => i.type === 'other')
   const nonOther = items.filter(i => i.type !== 'other')
@@ -384,8 +387,17 @@ function reorderAndCollapseSubsystemLines(
   }
 
   const limit = Math.max(1, maxItems)
-  const kept = items.slice(0, limit)
-  const folded = items.slice(limit)
+  // 具体设备驱动永远排在最后，且最多展开 MAX_SPECIFIC_DRIVER_ITEMS 条；
+  // 驱动框架/核心代码优先占满名额。
+  const nonSpecific = items.filter(i => i.driverScope !== 'specific')
+  const specific = items.filter(i => i.driverScope === 'specific')
+  const keptNonSpecific = nonSpecific.slice(0, limit)
+  const specificBudget = Math.max(0, limit - keptNonSpecific.length)
+  const keptSpecific = specific.slice(0, Math.min(MAX_SPECIFIC_DRIVER_ITEMS, specificBudget))
+  const kept = [...keptNonSpecific, ...keptSpecific]
+
+  const keptSet = new Set(kept)
+  const folded = items.filter(i => !keptSet.has(i))
 
   const outLines = kept.map(it => `- ${it.raw}`)
   if (folded.length > 0) {
@@ -562,6 +574,239 @@ function detectPerfRelated(text: string): boolean {
   )
 }
 
+// 社区动态的取舍/排序规则（用户重点关注方向）：
+// 1) arm64 / x86 架构相关改动优先，其他架构降权；
+// 2) 性能、功能相关的重构与优化优先，bugfix 降权；
+// 3) 驱动只看框架层（driver core / OF / ACPI / bus / DMA / PCI core / 子系统 core），
+//    具体型号驱动的改动大幅降权。
+// 分数只用于排序与折叠，不改变条目的 type / perf 标记。
+type ArchScope = 'arm64' | 'x86' | 'other' | ''
+type DriverScope = 'framework' | 'specific' | 'none'
+type PriorityCategory = 'perf' | 'feature' | 'refactor' | 'other' | 'bugfix'
+
+export interface ArticlePriorityAnalysis {
+  score: number
+  arch: ArchScope
+  driverScope: DriverScope
+  category: PriorityCategory
+}
+
+interface ArticlePriorityByUrlEntry {
+  score: number
+  driverScope: DriverScope
+}
+
+const ARCH64_TITLE_KEYS = new Set(['arm64', 'aarch64'])
+const X86_TITLE_KEYS = new Set(['x86', 'x86_64', 'amd64'])
+const OTHER_ARCH_TITLE_KEYS = new Set([
+  'arm', 'riscv', 'powerpc', 'ppc', 'ppc64', 'mips', 's390', 'loongarch', 'parisc',
+  'sparc', 'ia64', 'alpha', 'm68k', 'openrisc', 'nios2', 'hexagon', 'arc', 'csky',
+  'xtensa', 'microblaze', 'um',
+])
+
+// 标题前缀（如 "arm64: mm: ..."、"riscv: ..."）在 cover letter 没有 changedFiles 时兜底。
+const ARCH_TITLE_PREFIX_RE =
+  /^(?:\s*\[[^\]]*\]\s*)*(arm64|aarch64|x86_64|x86|amd64|arm|riscv|powerpc|ppc(?:64)?|mips|s390|loongarch|parisc|sparc|ia64|alpha|m68k|openrisc|nios2|hexagon|arc|csky|xtensa|microblaze|um)\s*:/i
+
+function normalizeRepoPath(p: string): string {
+  return (p || '').replace(/\\/g, '/').replace(/^\.\//, '').replace(/^\/+/, '')
+}
+
+function detectArchScope(title: string, files: string[]): ArchScope {
+  let scope: ArchScope = ''
+  for (const raw of files || []) {
+    const f = normalizeRepoPath(raw)
+    if (/^arch\/arm64\//i.test(f)) return 'arm64'
+    if (/^arch\/x86\//i.test(f)) return 'x86'
+    if (/^arch\/[A-Za-z0-9_-]+\//i.test(f)) scope = 'other'
+  }
+
+  const m = (title || '').match(ARCH_TITLE_PREFIX_RE)
+  if (!m) return scope
+
+  const key = m[1].toLowerCase()
+  if (scope === 'other') return 'other' // changedFiles 比标题前缀更可信
+  if (ARCH64_TITLE_KEYS.has(key)) return 'arm64'
+  if (X86_TITLE_KEYS.has(key)) return 'x86'
+  if (OTHER_ARCH_TITLE_KEYS.has(key)) return 'other'
+  return scope
+}
+
+// 驱动框架层文件：各子系统 core/class/bus 实现、总线/OF/ACPI/DMA/PCI core 等。
+// 具体型号驱动（drivers/gpu/drm/amd、drivers/net/ethernet/intel、drivers/iio/adc/... 等）
+// 不在此列表中，会被当作 specific 大幅降权。
+const DRIVER_FRAMEWORK_PATH_RES: RegExp[] = [
+  // drivers/<subsys>/{core,class,bus,framework,subsys}/ 下的核心实现
+  /^drivers\/[^/]+\/(?:core|class|bus|framework|subsys)\//i,
+  // drivers/<subsys>/<name>{-core,-class,-bus,-framework}.c
+  /^drivers\/[^/]+\/(?:[^/]*-)?(?:core|class|bus|framework|subsys)\.c$/i,
+  /^drivers\/base\//i,
+  /^drivers\/bus\//i,
+  /^drivers\/of\//i,
+  /^drivers\/virtio\//i,
+  /^drivers\/pci\/[^/]+\.c$/i,
+  /^drivers\/pci\/endpoint\//i,
+  /^drivers\/dma\/(?:dmaengine|of-dma|acpi-dma|dma-direct|dma-ops|virt-dma|dma-mapping)\.c$/i,
+  /^drivers\/i2c\/i2c-core/i,
+  /^drivers\/gpio\/gpiolib/i,
+  /^drivers\/spi\/spi\.c$/i,
+  /^drivers\/tty\/tty_/i,
+  /^drivers\/tty\/serial\/serial_core\.c$/i,
+  /^drivers\/usb\/core\//i,
+  /^drivers\/usb\/gadget\/(?:udc\/core|configfs)\.c$/i,
+  /^drivers\/mmc\/core\//i,
+  /^drivers\/gpu\/drm\/drm_[^/]*\.c$/i,
+  /^drivers\/gpu\/drm\/(?:ttm|gpu_sched|scheduler|display)\//i,
+  /^drivers\/iio\/industrialio/i,
+  /^drivers\/regulator\/(?:core|devres|of_regulator|helpers)\.c$/i,
+  /^drivers\/clk\/[^/]+\.c$/i,
+  /^drivers\/thermal\/thermal_(?:core|sysfs|helpers|netlink|hwmon)\.c$/i,
+  /^drivers\/power\/supply\/power_supply_(?:core|sysfs|leds)\.c$/i,
+  /^drivers\/leds\/led-(?:core|class|class-flash|triggers)\.c$/i,
+  /^drivers\/hid\/hid-(?:core|raw|debug)\.c$/i,
+  /^drivers\/input\/[^/]+\.c$/i,
+  /^drivers\/mfd\/mf-core\.c$/i,
+  /^drivers\/i3c\/(?:master|device|i3c)\.c$/i,
+  /^drivers\/interconnect\/core\.c$/i,
+  /^drivers\/reset\/core\.c$/i,
+  /^drivers\/phy\/phy-core\.c$/i,
+  /^drivers\/pwm\/core\.c$/i,
+  /^drivers\/rtc\/(?:class|interface|lib|rtc-proc|rtc-sysfs)\.c$/i,
+  /^drivers\/devfreq\/(?:devfreq|devfreq-event|governor_[^/]+)\.c$/i,
+  /^drivers\/opp\//i,
+  /^drivers\/pmdomain\/(?:core|governor[^/]*)\.c$/i,
+  /^drivers\/dma-buf\//i,
+  /^drivers\/iommu\/(?:iommu|iova|io-pgtable|dma-iommu)\.c$/i,
+  /^drivers\/mailbox\/mailbox\.c$/i,
+  /^drivers\/rpmsg\/rpmsg_(?:core|internal)\.c$/i,
+  /^drivers\/remoteproc\/remoteproc_(?:core|sysfs|virtio|debugfs|elf_loader|internal)\.c$/i,
+  /^drivers\/extcon\/extcon\.c$/i,
+  /^drivers\/nvmem\/core\.c$/i,
+  /^drivers\/slimbus\/(?:slimbus|slimbus-core)\.c$/i,
+  /^drivers\/soundwire\/(?:bus|master|slave|stream|sysfs|irq)\.c$/i,
+  /^drivers\/watchdog\/watchdog_(?:core|dev|pretimeout|hrtimer)\.c$/i,
+  /^sound\/core\//i,
+  /^sound\/soc\/soc-[^/]*\.c$/i,
+]
+
+function detectDriverScope(files: string[]): DriverScope {
+  const normalized = (files || []).map(normalizeRepoPath).filter(Boolean)
+  const driverCode = normalized.filter(
+    f => /^(?:drivers|sound)\//i.test(f) && /\.(?:c|h|S)$/i.test(f)
+  )
+  if (driverCode.length === 0) return 'none'
+
+  if (driverCode.some(f => DRIVER_FRAMEWORK_PATH_RES.some(re => re.test(f)))) {
+    return 'framework'
+  }
+
+  // 同时改动 net/、mm/、include/ 等非驱动代码的，属于跨层改动，不做「具体驱动」降权。
+  // dts/dtsi 也算非驱动代码：SoC/板级支持通常同时改 arch/<arch>/boot/dts 与 drivers/soc，
+  // 不应被当成纯具体驱动。
+  const otherCode = normalized.filter(
+    f => !/^(?:drivers|sound)\//i.test(f) && /\.(?:c|h|S|dts|dtsi)$/i.test(f)
+  )
+  return otherCode.length > 0 ? 'none' : 'specific'
+}
+
+const REFACTOR_RE =
+  /\b(?:refactor(?:ed|ing|s)?|restructur(?:e|ed|ing)|rework(?:ed|ing)?|consolidat(?:e|ed|ing)|reorganiz(?:e|ed|ing)|deduplicat(?:e|ed|ing)|simplif(?:y|ied|ies)|clean\s?up)\b/i
+
+function detectRefactorRelated(text: string): boolean {
+  return REFACTOR_RE.test(text || '')
+}
+
+// 影响面大的安全修复，允许在「bugfix 降权」之外小幅回升。
+const SECURITY_RE =
+  /\b(?:cve-\d{4}-\d+|security|vulnerab\w*|use[-\s]after[-\s]free|\buaf\b|out[-\s]of[-\s]bounds|privilege escalation|information leak)\b|漏洞|安全|越界|提权/i
+
+function detectSecurityRelated(text: string): boolean {
+  return SECURITY_RE.test(text || '')
+}
+
+// 影响范围：文件数越多、改到公共头文件或核心目录，优先级略高。
+function detectImpactBonus(files: string[]): number {
+  const normalized = (files || []).map(normalizeRepoPath).filter(Boolean)
+  const n = normalized.length
+  let bonus = n >= 10 ? 6 : n >= 5 ? 4 : n >= 2 ? 2 : 0
+  if (normalized.some(f => /^include\/(?:uapi\/linux|linux|asm-generic)\//i.test(f))) bonus += 3
+  if (normalized.some(f => /^(?:kernel|mm|fs|net|security|block|io_uring|virt|ipc|lib)\/[^/]+$/i.test(f))) {
+    bonus += 2
+  }
+  return Math.min(bonus, 10)
+}
+
+export function analyzeArticlePriority(a: Article): ArticlePriorityAnalysis {
+  const title = a.patchData?.title || a.gitCommitData?.title || a.title
+  const content = a.patchData?.content || a.gitCommitData?.content || a.content || ''
+  const files = a.patchData?.changedFiles || a.gitCommitData?.files || []
+  const type = getArticleType(a)
+  const signal = patchSignalText(title, content)
+  const perf = detectPerfRelated(signal)
+  const refactor = detectRefactorRelated(signal)
+  const security = detectSecurityRelated(signal)
+
+  let category: PriorityCategory
+  let score: number
+  if (perf) {
+    category = 'perf'
+    score = 40
+  } else if (type === 'feature') {
+    category = 'feature'
+    score = 30
+  } else if (refactor) {
+    category = 'refactor'
+    score = 25
+  } else if (type === 'other') {
+    category = 'other'
+    score = 10
+  } else {
+    category = 'bugfix'
+    score = 0
+  }
+
+  const arch = detectArchScope(title, files)
+  if (arch === 'arm64' || arch === 'x86') {
+    // arm64/x86 的特性和性能改动优先；同架构的 bugfix 也比其他架构更值得看
+    score += category === 'bugfix' ? 12 : 30
+  } else if (arch === 'other') {
+    // 仍高于具体驱动改动与大部分 bugfix，但低于 arm64/x86 与核心子系统
+    score -= 15
+  }
+
+  const driverScope = detectDriverScope(files)
+  if (driverScope === 'framework') score += 25
+  else if (driverScope === 'specific') score -= 50
+
+  if (security) score += 10
+  score += detectImpactBonus(files)
+  return { score, arch, driverScope, category }
+}
+
+export function scoreArticlePriority(a: Article): number {
+  return analyzeArticlePriority(a).score
+}
+
+function buildArticlePriorityByUrl(articles: Article[]): Map<string, ArticlePriorityByUrlEntry> {
+  const out = new Map<string, ArticlePriorityByUrlEntry>()
+  for (const a of articles) {
+    const { score, driverScope } = analyzeArticlePriority(a)
+    for (const url of [a.patchData?.url, a.gitCommitData?.url, a.url]) {
+      if (!url) continue
+      const prev = out.get(url)
+      if (!prev || score > prev.score) out.set(url, { score, driverScope })
+    }
+  }
+  return out
+}
+
+// 子系统级优先级：最强条目 + 高优先级条目数量（影响面），用于详情小节和总览的排序。
+export function scoreSubsystemPriority(articles: Article[]): number {
+  if (!articles.length) return 0
+  const scores = articles.map(scoreArticlePriority).sort((a, b) => b - a)
+  return scores[0] + Math.min(scores.filter(s => s >= 25).length, 8)
+}
+
 function getArticleType(a: Article): 'feature' | 'bugfix' | 'other' {
   const t = (a.patchData?.type || a.gitCommitData?.type) as any
   if (t === 'feature' || t === 'bugfix' || t === 'other') return t
@@ -632,9 +877,19 @@ async function summarizeSubsystem(
   maxItems?: number
 ): Promise<string> {
   const defaultPrompt =
-    '你是 Linux 内核开发专家。现在只分析单个子系统下的补丁/提交动态。\n\n输出要求：\n- 用中文\n- 不要输出思考过程\n- 不要输出任何 Markdown 标题\n- 逐条输出该子系统的具体改动，每条单独一行；一个补丁/提交一条，不要合并成一条\n- 每条控制在 80 字以内，只说清「改了什么 + 带来什么影响或收益」\n- 每条必须包含：`feature`/`bugfix`/`other` 标记；若为性能优化/性能相关需额外标注 `perf`\n- 每条行末必须包含补丁/提交的原始链接，格式为 [↗](https://...)\n- 不要原样复述 title，也不要写固定句式的评价：禁止「该改动重要在于」「点评：」「值得关注」「整体风险低」「属于……的改进」\n- 除非确有兼容性、ABI 或安全风险需要提醒，不要额外加一句评价\n'
+    '你是 Linux 内核开发专家。现在只分析单个子系统下的补丁/提交动态。\n\n输出要求：\n- 用中文\n- 不要输出思考过程\n- 不要输出任何 Markdown 标题\n- 逐条输出该子系统的具体改动，每条单独一行；一个补丁/提交一条，不要合并成一条\n- 每条控制在 80 字以内，只说清「改了什么 + 带来什么影响或收益」\n- 每条必须包含：`feature`/`bugfix`/`other` 标记；若为性能优化/性能相关需额外标注 `perf`\n- 每条行末必须包含补丁/提交的原始链接，格式为 [↗](https://...)\n' +
+    '- 子系统内按重要程度从高到低输出：arm64/x86 架构相关的性能/功能/重构 > 其他子系统的性能/功能/重构 > 其他架构改动 > `bugfix` > 具体设备驱动（非驱动框架）\n' +
+    '- 驱动类改动优先保留驱动框架层（driver core、OF/ACPI、bus、DMA、PCI core、各子系统 core）的重构/优化；具体型号驱动的普通改动不要排在前面\n' +
+    '- 不要原样复述 title，也不要写固定句式的评价：禁止「该改动重要在于」「点评：」「值得关注」「整体风险低」「属于……的改进」\n' +
+    '- 除非确有兼容性、ABI 或安全风险需要提醒，不要额外加一句评价\n'
 
   const systemPrompt = (prompt || defaultPrompt).trim()
+
+  // 按同一套优先级把输入排好，让模型先看到最值得关注的条目
+  const orderedArticles = [...subsystemArticles].sort(
+    (a, b) => scoreArticlePriority(b) - scoreArticlePriority(a)
+  )
+  const priorityByUrl = buildArticlePriorityByUrl(subsystemArticles)
 
   const messages: ChatCompletionMessageParam[] = [
     { role: 'system', content: systemPrompt },
@@ -643,7 +898,7 @@ async function summarizeSubsystem(
       content:
         `子系统：${subsystem}\n` +
         `补丁/提交条目如下（每行含 type/tag/link 等字段）：\n\n` +
-        buildSubsystemInputLines(subsystemArticles),
+        buildSubsystemInputLines(orderedArticles),
     },
   ]
 
@@ -661,7 +916,7 @@ async function summarizeSubsystem(
     normalizeSummaryTagLines(stripBoilerplate(cleanAIResponse(rawContent)))
   ).trim()
   const tagged = applySourceTags(normalized, subsystemArticles)
-  const ordered = reorderAndCollapseSubsystemLines(tagged, maxItems)
+  const ordered = reorderAndCollapseSubsystemLines(tagged, maxItems, priorityByUrl)
   return dropFeatureLabels(ordered)
 }
 
@@ -779,10 +1034,42 @@ function enforceOverviewBudget(lines: string[], maxChars: number): string[] {
   return out
 }
 
+// 总览行的最终排序兜底：模型负责挑选内容，这里按同一套优先级把行序钉死。
+// 基线取子系统级优先级，再用行内出现的架构/类型关键词微调。
+function overviewLinePriority(
+  line: string,
+  subsystemPriority: Map<string, number>,
+  subsystems: string[]
+): number {
+  const { label, body } = splitOverviewLine(line, subsystems)
+  const base = subsystemPriority.get(label) ?? 0
+  const text = body || line
+  let boost = 0
+  if (/(?:^|[^a-z0-9])(?:arm64|aarch64|x86_64|x86|amd64)(?:[^a-z0-9]|$)/i.test(text)) boost += 20
+  if (/(?:^|[^a-z0-9])(?:riscv|powerpc|ppc|mips|s390|loongarch|sparc|parisc|m68k|arm32)(?:[^a-z0-9]|$)/i.test(text)) boost -= 20
+  if (/(性能|吞吐|延迟|加速|perf)/i.test(text)) boost += 12
+  if (/(重构|统一|简化|合并|整理|优化)/.test(text)) boost += 8
+  // 安全修复属于「高影响 bugfix」，不按普通 bugfix 降权
+  if (detectSecurityRelated(text)) boost += 4
+  else if (/(修复|修正|回归|\bbug\b|\bfix(?:es|ed)?\b)/i.test(text)) boost -= 8
+  if (/(驱动框架|driver core|核心框架|框架层|子系统\s*core)/i.test(text)) boost += 10
+  return base * 0.6 + boost
+}
+
+interface PriorityHint {
+  subsystem: string
+  title: string
+  score: number
+  category: PriorityCategory
+  arch: ArchScope
+  driverScope: DriverScope
+}
+
 async function summarizeOverall(
-  subsystemSummaries: { subsystem: string; summary: string }[],
+  subsystemSummaries: { subsystem: string; summary: string; priority?: number }[],
   prompt: string | undefined,
-  maxChars: number = DEFAULT_SUMMARY_MAX_CHARS
+  maxChars: number = DEFAULT_SUMMARY_MAX_CHARS,
+  priorityHints: PriorityHint[] = []
 ): Promise<string> {
   const defaultPrompt =
     '你是 Linux 内核开发专家。你将收到多个子系统的条目式总结。\n\n输出要求：\n- 用中文\n- 不要输出思考过程\n- 不要输出任何 Markdown 标题\n- 输出 Markdown 无序列表，共 3~6 条，按重要性从高到低排序\n- 每条格式固定为：<图标> <一句话>（<子系统名>），子系统名必须与输入中的「## 子系统名」完全一致\n- 跨子系统挑当天全局最值得关注的动态，不要按子系统逐个铺开\n'
@@ -793,19 +1080,51 @@ async function summarizeOverall(
     '- 全文 3~6 条，按重要性从高到低排序；宁可少于 6 条，也不要为凑数硬写\n' +
     '- 每条一句话（不超过 70 字），只讲一个动态，不要把多个改动挤进同一条\n' +
     '- 每条行末用中文括号标注子系统名，例如（Memory）；这个名字会被渲染成跳转到详情的链接，必须准确\n' +
-    '- 优先挑选：性能收益、新特性/新接口、安全修复、回归修复、有争议或有兼容性风险的改动\n' +
+    '- 排序与取舍按以下优先级（从高到低）：\n' +
+    '  1) arm64 / x86 架构相关的性能优化、功能特性、重构\n' +
+    '  2) 核心子系统的性能、功能重构与优化，以及影响面大的公共接口/ABI 改动\n' +
+    '  3) 驱动框架层（driver core、OF/ACPI、bus、DMA、PCI core、各子系统 core）的优化或重构\n' +
+    '  4) 其他架构（riscv/powerpc/mips/s390/loongarch/arm32 等）的改动、`bugfix`\n' +
+    '- 不要收录具体设备驱动的动态（某型号 GPU/网卡/传感器/控制器驱动、板级适配等）；\n' +
+    '  驱动只取框架层面的优化与重构\n' +
+    '- `perf` 标记的条目按性能优化对待，即使同时带 `bugfix`\n' +
+    '- 输入开头的「高优先级候选」由规则计算，优先从中挑选；若它们确实不如其他动态重要，可以不用\n' +
     '- 禁止空话：「以清理为主」「风险较低」「值得关注」「属于……的改进」等；\n' +
-    '  某子系统当天没有实质动态就不要出现在总览里\n' +
+    '  某子系统当天没有符合上述优先级的动态就不要出现在总览里\n' +
     `- 全文不超过 ${maxChars} 字`
 
   const systemPrompt = `${(prompt || defaultPrompt).trim()}${budgetRule}`
 
-  const merged = subsystemSummaries
+  // 高优先级子系统先交给模型看，配合硬约束引导取舍；最终行序还会再按规则兜底排序。
+  const merged = [...subsystemSummaries]
     .filter(s => s.summary.trim())
+    .sort((a, b) => (b.priority ?? 0) - (a.priority ?? 0))
     .map(s => `## ${s.subsystem}\n${s.summary.trim()}`)
     .join('\n\n')
 
+  const hintText =
+    priorityHints.length > 0
+      ? `【按规则计算的高优先级候选（分数越高越优先）】\n` +
+        priorityHints
+          .map((h, idx) => {
+            const flags = [
+              h.category,
+              h.arch,
+              h.driverScope !== 'none' ? h.driverScope : '',
+            ]
+              .filter(Boolean)
+              .join('/')
+            return `${idx + 1}. [${h.score}] ${h.subsystem} | ${flags} | ${h.title}`
+          })
+          .join('\n')
+      : ''
+
+  const userContent = [hintText, merged].filter(Boolean).join('\n\n') || '（无子系统条目）'
+
   const subsystems = subsystemSummaries.map(s => s.subsystem).filter(Boolean)
+  const subsystemPriority = new Map(
+    subsystemSummaries.map(s => [s.subsystem, s.priority ?? 0] as const)
+  )
 
   let lines: string[] = []
   let droppedLabels: string[] = []
@@ -819,7 +1138,7 @@ async function summarizeOverall(
 
     const messages: ChatCompletionMessageParam[] = [
       { role: 'system', content: `${systemPrompt}${retryRule}` },
-      { role: 'user', content: merged || '（无子系统条目）' },
+      { role: 'user', content: userContent },
     ]
 
     const result = await withRetry(async () => {
@@ -844,7 +1163,16 @@ async function summarizeOverall(
         kept.push(line)
       }
     }
+    // 模型可能按自己的理解排序，这里按「重点模块 > 影响范围 > bugfix/其他架构」再钉一次。
+    // 同分保持模型原顺序（稳定排序）。
     lines = kept
+      .map((line, idx) => ({
+        line,
+        idx,
+        score: overviewLinePriority(line, subsystemPriority, subsystems),
+      }))
+      .sort((a, b) => b.score - a.score || a.idx - b.idx)
+      .map(item => item.line)
 
     if (countVisibleChars(lines.join('\n')) <= maxChars) break
   }
@@ -989,6 +1317,30 @@ export async function generateSummary(
     `[AI] 子系统数: ${subsystemEntries.length}，参与AI总结子系统: ${primarySubsystems.length}，子系统总结并发: ${concurrency}`
   )
 
+  const subsystemPriorities = new Map(
+    primarySubsystems.map(e => [e.subsystem, scoreSubsystemPriority(e.list)] as const)
+  )
+  console.log(
+    `[AI] 子系统优先级: ${primarySubsystems
+      .map(e => `${e.subsystem}=${subsystemPriorities.get(e.subsystem)}`)
+      .join(', ')}`
+  )
+
+  // 给总览模型一份规则算出的候选清单：光靠子系统摘要里的标签，模型容易漏掉
+  // 「perf + bugfix」或标成 other 的驱动框架重构。
+  const rankedHints: PriorityHint[] = primarySubsystems
+    .flatMap(entry =>
+      entry.list.map(a => ({
+        subsystem: entry.subsystem,
+        title: a.patchData?.title || a.gitCommitData?.title || a.title,
+        ...analyzeArticlePriority(a),
+      }))
+    )
+    .sort((a, b) => b.score - a.score)
+  // 具体设备驱动不进总览，也不放进候选清单；整天的条目都是具体驱动时才退回完整列表
+  const nonSpecificHints = rankedHints.filter(h => h.driverScope !== 'specific')
+  const priorityHints = (nonSpecificHints.length > 0 ? nonSpecificHints : rankedHints).slice(0, 8)
+
   const subsystemSummaries = await mapWithConcurrency(primarySubsystems, concurrency, async (entry) => {
     const summary = await summarizeSubsystem(
       entry.subsystem,
@@ -996,13 +1348,19 @@ export async function generateSummary(
       options.subsystemPrompt || options.summaryPrompt,
       options.subsystemMaxItems
     )
-    return { subsystem: entry.subsystem, summary, articleCount: entry.list.length }
+    return {
+      subsystem: entry.subsystem,
+      summary,
+      articleCount: entry.list.length,
+      priority: subsystemPriorities.get(entry.subsystem) ?? 0,
+    }
   })
 
   const overall = await summarizeOverall(
     subsystemSummaries,
     options.overallPrompt,
-    options.summaryMaxChars ?? DEFAULT_SUMMARY_MAX_CHARS
+    options.summaryMaxChars ?? DEFAULT_SUMMARY_MAX_CHARS,
+    priorityHints
   )
 
   const parts: string[] = []
@@ -1010,9 +1368,12 @@ export async function generateSummary(
   parts.push('')
   parts.push(overall || `今日共收集到 ${articles.length} 条记录。`)
 
-  // 详情区按当天活跃度（条目数）排序，而不是固定的 config 顺序：
-  // 当天最热闹的子系统排在最前面，读者不用先翻过一片安静的板块。
-  const orderedSummaries = [...subsystemSummaries].sort((a, b) => b.articleCount - a.articleCount)
+  // 详情区按优先级排序，而不是固定的 config 顺序或当天活跃度：
+  // arm64/x86、性能/功能重构、驱动框架改动排前面；具体驱动堆满的子系统即使条目多也靠后。
+  // 同优先级再按条目数，读者先看到重点板块。
+  const orderedSummaries = [...subsystemSummaries].sort(
+    (a, b) => b.priority - a.priority || b.articleCount - a.articleCount
+  )
 
   for (const s of orderedSummaries) {
     const body = s.summary.trim()
