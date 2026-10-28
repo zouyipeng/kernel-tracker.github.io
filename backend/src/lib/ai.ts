@@ -692,7 +692,8 @@ const DRIVER_FRAMEWORK_PATH_RES: RegExp[] = [
 function detectDriverScope(files: string[]): DriverScope {
   const normalized = (files || []).map(normalizeRepoPath).filter(Boolean)
   const driverCode = normalized.filter(
-    f => /^(?:drivers|sound)\//i.test(f) && /\.(?:c|h|S)$/i.test(f)
+    // .rs 是 Rust 驱动（如 nova-core）；框架路径目前都是 C 实现，Rust 驱动默认按具体驱动处理
+    f => /^(?:drivers|sound)\//i.test(f) && /\.(?:c|h|S|rs)$/i.test(f)
   )
   if (driverCode.length === 0) return 'none'
 
@@ -700,11 +701,21 @@ function detectDriverScope(files: string[]): DriverScope {
     return 'framework'
   }
 
-  // 同时改动 net/、mm/、include/ 等非驱动代码的，属于跨层改动，不做「具体驱动」降权。
-  // dts/dtsi 也算非驱动代码：SoC/板级支持通常同时改 arch/<arch>/boot/dts 与 drivers/soc，
-  // 不应被当成纯具体驱动。
+  // 同时改动核心代码树的，属于跨层改动，不做「具体驱动」降权。
+  // 只认核心目录与公共头文件：include/linux/mfd/xxx.h 这类驱动私有头不算；
+  // LKML diffstat 偶尔把长路径缩写成 ".../foo.c"，无法判断归属，直接忽略。
+  // arch/ 也算核心树：SoC/板级支持通常同时改 arch/<arch>/boot/dts 与 drivers/soc。
+  const isCoreTree = (f: string) =>
+    /^(?:arch|kernel|mm|fs|net|security|block|io_uring|virt|ipc|lib)\//i.test(f)
+  const isGenericHeader = (f: string) =>
+    /^include\/(?:uapi\/linux|linux)\/[^/]+\.h$/i.test(f) ||
+    /^include\/asm-generic\//i.test(f)
+
   const otherCode = normalized.filter(
-    f => !/^(?:drivers|sound)\//i.test(f) && /\.(?:c|h|S|dts|dtsi)$/i.test(f)
+    f =>
+      !/^(?:drivers|sound)\//i.test(f) &&
+      !f.startsWith('.../') &&
+      (isCoreTree(f) || isGenericHeader(f))
   )
   return otherCode.length > 0 ? 'none' : 'specific'
 }

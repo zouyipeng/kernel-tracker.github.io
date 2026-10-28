@@ -13,11 +13,25 @@ import { loadSourcesConfig, type Article, type LKMLPatch } from '../lib/storage'
 // 注意：lkml.org 前置了 Anubis 反爬（对浏览器 UA 下发 JS PoW 挑战），
 // 正式流程用 puppeteer 解题；本脚本只做离线对照，直接用非浏览器 UA 绕开挑战。
 // 走 curl 而不是 node 的 http 客户端：这台机器上 node 直连 lkml.org 会超时，curl 正常。
-function fetchText(url: string, timeoutSec = 60): string {
-  return execFileSync('curl', ['-sS', '--max-time', String(timeoutSec), url], {
-    maxBuffer: 64 * 1024 * 1024,
-    encoding: 'utf8',
-  })
+function fetchText(url: string, timeoutSec = 180): string {
+  return execFileSync(
+    'curl',
+    [
+      '-sS',
+      '--max-time',
+      String(timeoutSec),
+      '--retry',
+      '2',
+      '--retry-delay',
+      '2',
+      '--retry-all-errors',
+      url,
+    ],
+    {
+      maxBuffer: 64 * 1024 * 1024,
+      encoding: 'utf8',
+    }
+  )
 }
 const EXCLUDE_AUTHORS = ['kernel test robot']
 
