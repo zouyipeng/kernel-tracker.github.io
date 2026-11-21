@@ -71,11 +71,11 @@ cd backend && npm install && cd ..
     {
       "name": "Mailing List",
       "type": "lkml",
-      "url": "https://lkml.org/",
+      "url": "https://lore.kernel.org/lkml/",
       "active": true,
       "excludeAuthors": ["kernel test robot"],
-      "lkmlDetailConcurrency": 12,
-      "lkmlDetailTimeoutMs": 8000
+      "lkmlPageTimeoutMs": 60000,
+      "lkmlMaxPages": 50
     },
     {
       "name": "Mainline",

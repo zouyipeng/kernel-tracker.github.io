@@ -1,165 +1,51 @@
 // 对照工具：抓取指定日期的真实 LKML 补丁，跑一遍 generateSummary 并写到
 // .preview-<date>.md，用来评估 prompt / 排序 / 折叠策略的改动效果。
 // 用法：npx tsx src/scripts/preview-summary.ts 2026-09-28 [抽稀条数]
-// 注意：并发刻意压到和生产一致（4），抓太快会被 lkml.org 限流。
-import { execFileSync } from 'child_process'
-import * as cheerio from 'cheerio'
+// 数据来自 lore.kernel.org 的 Atom 搜索流（lkml.org 已不可用）。
+// lore 前置了 Anubis 反爬，这里用 headless Chrome 过挑战；消息正文随 Atom entry 一起返回，
+// 不需要再逐条抓补丁详情页。
 import fs from 'fs'
 import path from 'path'
 import { analyzeArticlePriority, generateSummary, inferPatchTypeRuleBased } from '../lib/ai'
 import { inferFixedSubsystemFromFiles } from '../lib/fixedSubsystem'
 import { loadSourcesConfig, type Article, type LKMLPatch } from '../lib/storage'
+import {
+  fetchLoreMessages,
+  isLkmlPatchMessage,
+  launchLoreBrowser,
+  parseLkmlPatchText,
+} from '../lib/lore'
 
-// 注意：lkml.org 前置了 Anubis 反爬（对浏览器 UA 下发 JS PoW 挑战），
-// 正式流程用 puppeteer 解题；本脚本只做离线对照，直接用非浏览器 UA 绕开挑战。
-// 走 curl 而不是 node 的 http 客户端：这台机器上 node 直连 lkml.org 会超时，curl 正常。
-function fetchText(url: string, timeoutSec = 180): string {
-  return execFileSync(
-    'curl',
-    [
-      '-sS',
-      '--max-time',
-      String(timeoutSec),
-      '--retry',
-      '2',
-      '--retry-delay',
-      '2',
-      '--retry-all-errors',
-      url,
-    ],
-    {
-      maxBuffer: 64 * 1024 * 1024,
-      encoding: 'utf8',
-    }
-  )
-}
 const EXCLUDE_AUTHORS = ['kernel test robot']
-
-async function mapPool<T, R>(items: T[], size: number, fn: (t: T) => Promise<R>): Promise<R[]> {
-  const out: R[] = new Array(items.length)
-  let next = 0
-  await Promise.all(
-    Array.from({ length: Math.min(size, items.length) }, async () => {
-      for (;;) {
-        const i = next++
-        if (i >= items.length) return
-        out[i] = await fn(items[i])
-      }
-    })
-  )
-  return out
-}
-
-type Msg = { url: string; title: string; author: string; date: string }
-
-function collectMessages(html: string, day: string): Msg[] {
-  const $ = cheerio.load(html)
-  const out: Msg[] = []
-  for (const el of $('table.mh tr.c0, table.mh tr.c1').toArray()) {
-    const $tds = $(el).find('td')
-    const statusText = $tds.eq(0).text().replace(/\s+/g, ' ').trim()
-    if (!statusText.includes('[New]')) continue
-
-    const $link = $tds.eq(1).find('a:first-child')
-    const $authorTd = $tds.eq(2)
-    const title = $link.text().trim()
-    const link = $link.attr('href')
-    const author = $authorTd.find('a').text().trim() || $authorTd.text().trim()
-    if (!title || !link) continue
-    if (title.toLowerCase().startsWith('re:')) continue
-    if (EXCLUDE_AUTHORS.some(ex => author.toLowerCase().includes(ex))) continue
-    const lower = title.toLowerCase()
-    if (!['patch', 'diff', 'git pull', 'rfc'].some(k => lower.includes(k))) continue
-
-    const timeMatch = statusText.match(/(\d{1,2}):(\d{2})/)
-    const [y, m, d] = day.split('-').map(Number)
-    const date = new Date(y, m - 1, d)
-    if (timeMatch) date.setHours(Number(timeMatch[1]), Number(timeMatch[2]), 0, 0)
-
-    out.push({
-      url: link.startsWith('http') ? link : `https://lkml.org${link}`,
-      title,
-      author,
-      date: date.toISOString(),
-    })
-  }
-  return out
-}
-
-function parsePatchText(rawText: string): { commitMessage: string; changedFiles: string[] } {
-  const normalized = (rawText || '').replace(/\r/g, '').trim()
-  if (!normalized) return { commitMessage: '', changedFiles: [] }
-  const lines = normalized.split('\n').map(l => l.trimEnd())
-  const divider = lines.findIndex(l => l.trim() === '---')
-  const msgLines = divider >= 0 ? lines.slice(0, divider) : lines
-  let commitMessage = msgLines.filter(l => l.trim().length > 0).join('\n').trim()
-  if (!commitMessage || commitMessage.length < 10) {
-    commitMessage = normalized.split(/\bdiff --git\b/i)[0].split(/\n---\s|\s---\s/)[0].trim()
-  }
-  const changedFiles = new Set<string>()
-  for (const line of lines) {
-    const diffStatRe = /(^|\s)(\S+?)\s+\|\s+\d+\b/g
-    let m: RegExpExecArray | null
-    while ((m = diffStatRe.exec(line)) !== null) {
-      const c = m[2].trim()
-      if (!c || c.length > 200 || !/[\/.]/.test(c) || c.includes('://')) continue
-      if (/^(hi|this|patch|from|signed-off-by)$/i.test(c)) continue
-      changedFiles.add(c)
-    }
-    const g = line.match(/\bdiff --git a\/(\S+)\s+b\/(\S+)/)
-    if (g) changedFiles.add(g[2].trim())
-    const minus = line.match(/---\s+a\/(\S+)/)
-    if (minus) changedFiles.add(minus[1].trim())
-    const plus = line.match(/\+\+\+\s+b\/(\S+)/)
-    if (plus) changedFiles.add(plus[1].trim())
-  }
-  return { commitMessage, changedFiles: Array.from(changedFiles) }
-}
-
-async function fetchDetails(url: string) {
-  try {
-    const $ = cheerio.load(fetchText(url, 30))
-    // 与正式流程一致：LKML 用 <br /> 断行，必须先还原成换行
-    $('pre').find('br').replaceWith('\n')
-    const preTexts = $('pre').toArray().map(el => $(el).text().trim()).filter(Boolean)
-    const score = (t: string) => {
-      let s = 0
-      if (/\bdiff --git\b/i.test(t)) s += 50
-      if (/^---\s+a\//m.test(t) && /^\+\+\+\s+b\//m.test(t)) s += 30
-      if (/^Signed-off-by:/mi.test(t)) s += 10
-      if (t.length > 4000) s += 5
-      return s
-    }
-    const best = (preTexts.sort((a, b) => score(b) - score(a))[0] || '').trim()
-    return parsePatchText(best)
-  } catch {
-    return { commitMessage: '', changedFiles: [] as string[] }
-  }
-}
+const LORE_BASE_URL = 'https://lore.kernel.org/lkml/'
 
 async function collectArticles(day: string): Promise<Article[]> {
-  const d = new Date(day)
-  const prev = new Date(d)
-  prev.setDate(prev.getDate() - 1)
-  const fmt = (x: Date) => `${x.getFullYear()}/${x.getMonth() + 1}/${x.getDate()}`
+  const [y, m, d] = day.split('-').map(Number)
+  const target = new Date(y, m - 1, d)
 
-  const seen = new Set<string>()
-  const msgs: Msg[] = []
-  for (const url of [`https://lkml.org/lkml/${fmt(prev)}`, `https://lkml.org/lkml/${fmt(d)}`]) {
-    for (const m of collectMessages(fetchText(url), url.split('/').slice(-3).join('-'))) {
-      if (seen.has(m.url)) continue
-      seen.add(m.url)
-      msgs.push(m)
-    }
+  const browser = await launchLoreBrowser({ headless: true })
+  if (!browser) throw new Error('未找到 Chrome/Edge 浏览器，请设置 CHROME_PATH 环境变量')
+
+  let messages
+  try {
+    messages = await fetchLoreMessages(browser, LORE_BASE_URL, {
+      since: target,
+      until: target,
+      timeoutMs: 60000,
+      maxPages: 50,
+    })
+  } finally {
+    await browser.close()
   }
-  console.log(`[preview] 解析到 ${msgs.length} 条 patch，开始抓详情...`)
 
-  const details = await mapPool(msgs, 4, m => fetchDetails(m.url))
-  return msgs.map((m, i) => {
-    const { commitMessage, changedFiles } = details[i]
+  const patches = messages.filter(msg => isLkmlPatchMessage(msg, EXCLUDE_AUTHORS))
+  console.log(`[preview] 解析到 ${patches.length} 条 patch`)
+
+  return patches.map((msg, i) => {
+    const { commitMessage, changedFiles } = parseLkmlPatchText(msg.body)
     const content = [
-      `补丁标题: ${m.title}`,
-      `补丁链接: ${m.url}`,
+      `补丁标题: ${msg.title}`,
+      `补丁链接: ${msg.url}`,
       '',
       'Commit message:',
       commitMessage || '未解析到 commit message',
@@ -170,20 +56,20 @@ async function collectArticles(day: string): Promise<Article[]> {
 
     const patchData: LKMLPatch = {
       id: `patch_${i}`,
-      title: m.title,
-      url: m.url,
-      author: m.author,
-      date: m.date,
+      title: msg.title,
+      url: msg.url,
+      author: msg.author,
+      date: msg.date,
       content,
       subsystem: '',
-      type: inferPatchTypeRuleBased(m.title, commitMessage || ''),
+      type: inferPatchTypeRuleBased(msg.title, commitMessage || ''),
       highlight: false,
       summary: '',
       changedFiles,
       messages: [],
       replyCount: 0,
     }
-    return { id: `art_${i}`, sourceName: 'Mailing List', title: m.title, author: m.author, url: m.url, fetchedAt: m.date, patchData }
+    return { id: `art_${i}`, sourceName: 'Mailing List', title: msg.title, author: msg.author, url: msg.url, fetchedAt: msg.date, patchData }
   })
 }
 

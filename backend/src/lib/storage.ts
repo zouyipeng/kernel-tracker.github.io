@@ -18,8 +18,10 @@ export interface Source {
   url: string
   active: boolean
   excludeAuthors?: string[]
-  lkmlDetailConcurrency?: number
-  lkmlDetailTimeoutMs?: number
+  // lore Atom 分页加载超时（毫秒），默认 60000
+  lkmlPageTimeoutMs?: number
+  // lore Atom 分页上限（单页 200 条），默认 50
+  lkmlMaxPages?: number
   gitConfig?: GitConfig
 }
 
